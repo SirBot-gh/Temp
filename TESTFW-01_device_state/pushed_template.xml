@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<template>
+  <entry name="TEST-TEMPLATE-STACK">
+    <config version="10.2.0">
+      <devices>
+        <entry name="localhost.localdomain">
+          <deviceconfig>
+            <system>
+              <permitted-ip>
+                <entry name="10.99.50.0/24"/>
+              </permitted-ip>
+              <service>
+                <disable-telnet>yes</disable-telnet>
+                <disable-http>yes</disable-http>
+              </service>
+            </system>
+            <setting>
+              <management>
+                <idle-timeout>10</idle-timeout>
+              </management>
+            </setting>
+          </deviceconfig>
+        </entry>
+      </devices>
+    </config>
+  </entry>
+</template>
