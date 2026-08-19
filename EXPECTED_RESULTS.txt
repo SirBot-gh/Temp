@@ -48,14 +48,15 @@ From DEVGROUP (4):
   DEVGROUP_NSC_address-groups.xml.txt
 
 ----------------------------------------------------
-3. FRAGMENTS NOT-PRESENT (42 lines expected)
+3. FRAGMENTS NOT-PRESENT (51 lines expected)
 ----------------------------------------------------
-LOCAL (7): AUTH_certificate-profile, AUTH_server-profiles,
+LOCAL (10): AUTH_certificate-profile, AUTH_server-profiles,
   AUTH_admin-role, NSC_pre-rulebase-security,
   NSC_post-rulebase-security, NSC_address-objects,
-  NSC_address-groups
-TEMPLATE (18): every fragment except the 3 listed above as present
-DEVGROUP (17): every fragment except the 4 listed above as present
+  NSC_address-groups, SVC_certificates, IMP_globalprotect,
+  MGT_high-availability
+TEMPLATE (21): every fragment except the 3 listed above as present
+DEVGROUP (20): every fragment except the 4 listed above as present
 
 ----------------------------------------------------
 4. GROUND-TRUTH COUNTS
@@ -76,6 +77,8 @@ LOCAL_security_rules_post          0
 LOCAL_nat_rules                    1
 LOCAL_permitted_ip_mgt             2
 LOCAL_ssl_tls_profiles             1
+LOCAL_certificates                 0
+LOCAL_gp_gateways                  0
 
 TEMPLATE_permitted_ip_mgt          1
 TEMPLATE_* (all other counts)      0
@@ -104,7 +107,17 @@ NOTE: the _extracted folder retains UNREDACTED source files by design
 only from fragments\.
 
 ----------------------------------------------------
-6. WHAT PASSING PROVES AND DOES NOT PROVE
+6. NOTE ON THE [entry] GUARD
+----------------------------------------------------
+LOCAL_AUTH_server-profiles and LOCAL_SVC_certificates are expected
+NOT-PRESENT even though the test config contains the strings
+"server-profile" and "certificate". Those occurrences are NAME
+REFERENCES inside other elements, not definition containers. The
+XPaths require an <entry> child so references cannot masquerade as
+definitions. If either appears as PRESENT with 2-3 lines, the guard
+is missing and false-presence fragments are being produced.
+
+7. WHAT PASSING PROVES AND DOES NOT PROVE
 ----------------------------------------------------
 Passing proves the script's mechanics work on your machine: archive
 extraction, content-based classification, XPath fragment extraction,
