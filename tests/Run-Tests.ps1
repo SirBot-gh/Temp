@@ -56,6 +56,10 @@ function Get-ManifestJson([string]$bundleName) {
 }
 
 function Get-PowerShellExe {
+    # Match the host edition so Windows PS 5.1 job exercises PS 5.1, not pwsh.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        return 'powershell'
+    }
     foreach ($cmd in @('pwsh', 'powershell')) {
         if (Get-Command $cmd -ErrorAction SilentlyContinue) { return $cmd }
     }
