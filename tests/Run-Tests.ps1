@@ -40,8 +40,17 @@ function Run-Sanitize {
     return $LASTEXITCODE
 }
 
+function Join-MultiPath {
+    param([Parameter(Mandatory)][string[]]$Parts)
+    $p = $Parts[0]
+    foreach ($part in $Parts[1..($Parts.Length - 1)]) {
+        $p = Join-Path $p $part
+    }
+    return $p
+}
+
 function Get-ManifestJson([string]$bundleName) {
-    $p = Join-Path $outRoot $bundleName 'MANIFEST.json'
+    $p = Join-MultiPath @($outRoot, $bundleName, 'MANIFEST.json')
     return Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
 }
 
@@ -76,7 +85,7 @@ Assert-Eq ([regex]::Matches($runningContent, 'REDACTED').Count) 3 'REDACTED coun
 Assert-False ($runningContent -match '\$5\$') 'no $5$ hashes in running-config'
 Assert-True ($runningContent -match '<hostname>PA-VM</hostname>') 'hostname preserved'
 
-$knobSrc = Join-Path $fixtures 'device_state_cfg' 'knob-setting.xml'
+$knobSrc = Join-MultiPath @($fixtures, 'device_state_cfg', 'knob-setting.xml')
 $knobOut = Join-Path $bundleDir 'knob-setting.txt'
 $knobBytesIn = [IO.File]::ReadAllBytes($knobSrc)
 $knobBytesOut = [IO.File]::ReadAllBytes($knobOut)
@@ -94,8 +103,10 @@ Clean-Out
 $code = Run-Sanitize -InputPath (Join-Path $fixtures 'canary_device_state.tar') -Force
 Assert-Eq $code 3 'canary exit code (parse failure)'
 $canaryDir = Join-Path $outRoot 'canary_device_state'
-Assert-True (Test-Path -LiteralPath (Join-Path $canaryDir 'sp\vsys1\pretrans-sp-config.txt')) 'sp output path'
-Assert-True (Test-Path -LiteralPath (Join-Path $canaryDir 'template\pretrans-template-config.txt')) 'template output path'
+$spOut = Join-MultiPath @($canaryDir, 'sp', 'vsys1', 'pretrans-sp-config.txt')
+$templateOut = Join-MultiPath @($canaryDir, 'template', 'pretrans-template-config.txt')
+Assert-True (Test-Path -LiteralPath $spOut) 'sp output path'
+Assert-True (Test-Path -LiteralPath $templateOut) 'template output path'
 Assert-False (Test-Path -LiteralPath (Join-Path $canaryDir 'broken.txt')) 'no broken.txt'
 
 $canaryManifest = Get-ManifestJson 'canary_device_state'
