@@ -36,8 +36,9 @@ function Run-Sanitize {
         '-OutputRoot', $outRoot
     )
     if ($Force) { $invokeArgs += '-Force' }
-    $proc = Start-Process -FilePath $psExe -ArgumentList $invokeArgs -Wait -PassThru -NoNewWindow
-    return $proc.ExitCode
+    & $psExe @invokeArgs
+    if ($null -ne $LASTEXITCODE) { return $LASTEXITCODE }
+    return 0
 }
 
 function Join-MultiPath {
