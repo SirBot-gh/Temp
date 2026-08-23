@@ -30,13 +30,13 @@ function Run-Sanitize {
         [string]$InputPath,
         [switch]$Force
     )
-    $args = @(
+    $invokeArgs = @(
         '-NoProfile', '-File', $scriptPath,
         '-InputPath', $InputPath,
         '-OutputRoot', $outRoot
     )
-    if ($Force) { $args += '-Force' }
-    & $psExe @args
+    if ($Force) { $invokeArgs += '-Force' }
+    & $psExe @invokeArgs
     return $LASTEXITCODE
 }
 
