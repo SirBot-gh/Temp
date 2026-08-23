@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<config version="10.2.0" urldb="paloaltonetworks">
+  <mgt-config>
+    <users>
+      <entry name="admin">
+        <phash>TESTHASH-SHOULD-BE-REDACTED-1</phash>
+      </entry>
+    </users>
+  </mgt-config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <deviceconfig>
+        <system>
+          <hostname>PA-VM</hostname>
+          <snmp-setting>
+            <access-setting>
+              <version>
+                <v2c><snmp-community-string>CANARY-COMMUNITY</snmp-community-string></v2c>
+              </version>
+            </access-setting>
+          </snmp-setting>
+        </system>
+      </deviceconfig>
+      <network>
+        <ike>
+          <crypto-profiles>
+            <ike-crypto-profile>
+              <entry name="test-ike">
+                <preshared-key><key>CANARY-PSK</key></preshared-key>
+              </entry>
+            </ike-crypto-profile>
+          </crypto-profiles>
+        </ike>
+      </network>
+      <vsys>
+        <entry name="vsys1">
+          <ldap>
+            <server-profile>
+              <entry name="ldap1">
+                <bind-password>CANARY-BIND</bind-password>
+              </entry>
+            </server-profile>
+          </ldap>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+  <certificate>
+    <entry name="test-cert">
+      <unknown-field>$6$abc$CANARYHASH</unknown-field>
+    </entry>
+  </certificate>
+</config>

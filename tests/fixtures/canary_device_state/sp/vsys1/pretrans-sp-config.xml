@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<device-group>
+  <entry name="TEST-DG">
+    <pre-rulebase>
+      <security>
+        <rules>
+          <entry name="canary-rule">
+            <from><member>any</member></from>
+            <to><member>any</member></to>
+            <source><member>any</member></source>
+            <destination><member>any</member></destination>
+            <application><member>any</member></application>
+            <service><member>any</member></service>
+            <action>allow</action>
+          </entry>
+        </rules>
+      </security>
+    </pre-rulebase>
+  </entry>
+</device-group>

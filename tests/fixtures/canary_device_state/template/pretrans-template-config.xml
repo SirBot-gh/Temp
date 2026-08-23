@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<template>
+  <entry name="TEST-STACK">
+    <config version="10.2.0">
+      <devices>
+        <entry name="localhost.localdomain">
+          <deviceconfig>
+            <system>
+              <snmp-setting>
+                <access-setting>
+                  <version>
+                    <v2c><snmp-community-string>CANARY-SNMP</snmp-community-string></v2c>
+                  </version>
+                </access-setting>
+              </snmp-setting>
+            </system>
+          </deviceconfig>
+          <vsys>
+            <entry name="vsys1">
+              <ldap>
+                <server-profile>
+                  <entry name="corp-ldap">
+                    <bind-password>CANARY-LDAP</bind-password>
+                  </entry>
+                </server-profile>
+              </ldap>
+            </entry>
+          </vsys>
+        </entry>
+      </devices>
+    </config>
+  </entry>
+</template>

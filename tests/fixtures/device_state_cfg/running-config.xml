@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<config version="10.2.0" urldb="paloaltonetworks">
+  <mgt-config>
+    <users>
+      <entry name="admin">
+        <phash>$5$rounds=10000$abc$defghijklmnop</phash>
+      </entry>
+      <entry name="backup">
+        <phash>$5$rounds=10000$xyz$qrstuvwxyz1234</phash>
+      </entry>
+      <entry name="readonly">
+        <phash>$1$salt$hashvaluehere</phash>
+      </entry>
+    </users>
+  </mgt-config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <deviceconfig>
+        <system>
+          <hostname>PA-VM</hostname>
+          <ip-address>10.10.10.10</ip-address>
+          <netmask>255.255.255.0</netmask>
+        </system>
+      </deviceconfig>
+    </entry>
+  </devices>
+</config>
