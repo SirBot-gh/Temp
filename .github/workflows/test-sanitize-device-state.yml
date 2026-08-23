@@ -1,0 +1,47 @@
+name: Test Sanitize-DeviceState
+
+on:
+  push:
+    paths:
+      - 'Sanitize-DeviceState.ps1'
+      - 'tests/**'
+      - '.github/workflows/test-sanitize-device-state.yml'
+  pull_request:
+    paths:
+      - 'Sanitize-DeviceState.ps1'
+      - 'tests/**'
+      - '.github/workflows/test-sanitize-device-state.yml'
+
+jobs:
+  pwsh-linux:
+    name: PowerShell 7 (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-powershell@v1
+      - name: Build tar fixtures from source trees
+        shell: bash
+        run: |
+          cd tests/fixtures
+          tar -cf device_state_cfg.tar -C device_state_cfg .
+          tar -cf canary_device_state.tar -C canary_device_state .
+          tar -czf TESTFW-01_device_state.tgz -C ../../TESTFW-01_device_state .
+      - name: Run Sanitize-DeviceState tests
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+
+  windows-ps51:
+    name: Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tar fixtures from source trees
+        shell: pwsh
+        run: |
+          Set-Location tests/fixtures
+          tar -cf device_state_cfg.tar -C device_state_cfg .
+          tar -cf canary_device_state.tar -C canary_device_state .
+          tar -czf TESTFW-01_device_state.tgz -C ../../TESTFW-01_device_state .
+      - name: Run Sanitize-DeviceState tests
+        shell: powershell
+        run: .\tests\Run-Tests.ps1
