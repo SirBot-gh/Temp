@@ -65,11 +65,13 @@ $IdentityElements = @(
     'hostname', 'serial', 'serial-number'
 )
 
+# Tag-content pattern uses a capture group instead of lookbehind so .NET Framework
+# (Windows PowerShell 5.1) can compile it.
 $SafetyNetPatterns = @(
     '\$[156]\$[^\s<]{1,120}',
-    '-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----',
-    '(?i)(?<=<(?!(?:password-complexity|password-profile)(?:\s|>))[^>]*(?:key|secret|passw)[^>]*>)[^<]{8,}'
+    '-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----'
 )
+$SafetyNetTagContentPattern = '(?i)<(?!(?:password-complexity|password-profile)(?:\s|>))[^>]*(?:key|secret|passw)[^>]*>([^<]{8,})'
 
 $OutputExtension = '.txt'
 $ArchiveExtensions = @('.tar', '.tgz', '.gz')
@@ -262,6 +264,28 @@ function ConvertTo-XmlString {
     return $sb.ToString()
 }
 
+function Apply-TagContentSafetyNet {
+    param([string]$Text)
+
+    $hits = 0
+    $out = $Text
+    $fixes = New-Object System.Collections.Generic.List[object]
+    foreach ($m in [regex]::Matches($out, $SafetyNetTagContentPattern)) {
+        $val = $m.Groups[1].Value
+        if ($val -eq 'REDACTED') { continue }
+        if ($val.Trim().Length -lt 8) { continue }
+        $fixes.Add([pscustomobject]@{
+            Index = $m.Groups[1].Index
+            Length = $val.Length
+        })
+    }
+    foreach ($fix in ($fixes | Sort-Object -Property Index -Descending)) {
+        $hits++
+        $out = $out.Remove($fix.Index, $fix.Length).Insert($fix.Index, 'REDACTED')
+    }
+    return [pscustomobject]@{ Text = $out; Hits = $hits }
+}
+
 function Invoke-SafetyNet {
     param([string]$Text)
 
@@ -276,6 +300,9 @@ function Invoke-SafetyNet {
             $out = $out.Replace($m.Value, 'REDACTED')
         }
     }
+    $tagPass = Apply-TagContentSafetyNet -Text $out
+    $hits += $tagPass.Hits
+    $out = $tagPass.Text
     return [pscustomobject]@{ Text = $out; Hits = $hits }
 }
 
@@ -297,6 +324,16 @@ function Test-OutputClean {
                         File = $rel
                         Detail = "safety-net pattern matched: $($m.Value.Substring(0, [Math]::Min(40, $m.Value.Length)))"
                     }
+                }
+            }
+        }
+        foreach ($m in [regex]::Matches($text, $SafetyNetTagContentPattern)) {
+            $val = $m.Groups[1].Value
+            if ($val -ne 'REDACTED' -and $val.Trim().Length -ge 8) {
+                return [pscustomobject]@{
+                    Ok = $false
+                    File = $rel
+                    Detail = "safety-net tag-content matched: $($val.Substring(0, [Math]::Min(40, $val.Length)))"
                 }
             }
         }

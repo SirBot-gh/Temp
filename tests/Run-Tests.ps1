@@ -16,6 +16,8 @@ function Assert-False($cond, [string]$msg) {
 }
 
 function Assert-Eq($a, $b, [string]$msg) {
+    if ($a -is [string] -and $b -isnot [string]) { $a = [int]$a }
+    if ($b -is [string] -and $a -isnot [string]) { $b = [int]$b }
     if ($a -ne $b) { throw "FAIL: $msg (expected '$b', got '$a')" }
 }
 
