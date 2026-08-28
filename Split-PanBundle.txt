@@ -1,0 +1,742 @@
+<#
+.SYNOPSIS
+  Split PAN-OS device state bundles (device_state_cfg.tgz) or standalone
+  running-config XML files into small per-control-area fragments plus a
+  manifest, for AI-assisted management plane assessment.
+
+.DESCRIPTION
+  Why this script exists:
+  The assessment AI (USAI.gov chat) cannot execute code and cannot untar
+  archives, and feeding it a whole 40,000-line config invites silent
+  truncation and fabricated findings. This script does the deterministic
+  work locally so the AI only ever sees small, verifiable fragments.
+
+  For each input bundle or XML file this script:
+    1. Extracts the archive (tar.exe, built into Windows 10 1803+).
+    2. Identifies every XML file by CONTENT (root element and structural
+       markers), never by filename, because bundle-internal filenames are
+       undocumented by Palo Alto and vary across PAN-OS versions. A
+       filename-based approach would silently miss files on some versions.
+    3. Classifies each XML as: local-config, pushed-template,
+       pushed-device-group, config-unclassified, or other. The class
+       becomes the fragment prefix (LOCAL_/TEMPLATE_/DEVGROUP_) so that
+       "where did this setting come from" survives into the AI sessions.
+       That distinction drives override detection and tells the customer
+       whether a fix belongs in Panorama or on the box.
+    4. Extracts a fixed set of control-area fragments from each config
+       via XPath. A fragment the source genuinely lacks is recorded as
+       NOT-PRESENT in the manifest rather than silently skipped, so
+       "absent" is always an explicit, reviewable claim.
+    5. Optionally redacts secrets (password hashes, keys, SNMP
+       communities) so fragments are safe to upload to an external AI.
+    6. Writes MANIFEST.txt and MANIFEST.csv.txt per device with file
+       roles, SHA256 hashes, fragment line counts, and ground-truth
+       element counts (interfaces, admins, profiles, rules). The AI's
+       extraction output must reconcile against these counts; a mismatch
+       means the AI dropped records.
+
+.PARAMETER InputPath
+  A single .tgz/.tar.gz/.xml file, or a folder containing them.
+  When a folder is given, only its top level is scanned (no recursion),
+  so stray archives in subfolders are not picked up by accident.
+
+.PARAMETER OutputRoot
+  Folder to write per-device output folders into. Created if missing.
+  Each input produces: <OutputRoot>\<bundle-name>\
+      _extracted\   raw extracted files (UNREDACTED - never upload these)
+      fragments\    per-control-area .xml.txt fragments (upload these)
+      MANIFEST.txt  human-readable manifest (goes into USAI session P0)
+      MANIFEST.csv.txt  machine-readable manifest (stays local / Excel)
+
+.PARAMETER Redact
+  Mask secret material in fragments before they are written.
+  Strongly recommended before any AI upload. Redaction happens on the
+  in-memory copy only; files under _extracted\ keep their original
+  content as local evidence.
+
+.EXAMPLE
+  .\Split-PanBundle.ps1 -InputPath C:\assess\bundles -OutputRoot C:\assess\split -Redact
+
+  Split every top-level bundle in a folder and redact secrets.
+
+.EXAMPLE
+  .\Split-PanBundle.ps1 -InputPath .\TESTFW-01_device_state.tgz -OutputRoot .\test-out -Redact
+
+  Prove the tool against the synthetic test bundle, then compare
+  test-out\TESTFW-01_device_state\MANIFEST.txt with EXPECTED_RESULTS.txt.
+
+.EXAMPLE
+  Get-Help .\Split-PanBundle.ps1 -Full
+
+  Show this comment-based help.
+
+.INPUTS
+  None. You cannot pipe objects to this script.
+
+.OUTPUTS
+  None. Writes per-device folders under OutputRoot.
+
+.NOTES
+  Windows PowerShell 5.1 and PowerShell 7+ on Windows 10/11.
+  No modules required. Requires tar.exe (Windows 10 1803+ / Windows 11).
+  Read-only with respect to inputs: source bundles are never modified.
+  Keep $RedactElements identical to Sanitize-DeviceState.ps1.
+#>
+
+[CmdletBinding()]
+param(
+    # Mandatory: prompting for these at runtime beats defaulting to a
+    # wrong directory when the script is double-clicked or run bare.
+    [Parameter(Mandatory = $true)]
+    [string]$InputPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputRoot,
+
+    # Switch (present/absent, no value). Absent means fragments carry
+    # secrets and the manifest says so loudly.
+    [switch]$Redact
+)
+
+# Fail fast: any unhandled error stops the run instead of producing a
+# half-written output folder that looks complete.
+$ErrorActionPreference = 'Stop'
+
+# ===========================================================================
+# CONFIGURATION TABLES
+# Everything assessment-specific lives in these three tables. To add a new
+# control area, add a FragmentMap entry; to add a new reconciliation count,
+# add a CountMap entry; to redact a new secret element, add its tag name to
+# RedactElements. No other code changes needed.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# FragmentMap: control-area name -> ordered list of candidate XPaths.
+#
+# How it is used: for each source XML, each control area's XPaths are tried
+# IN ORDER and the FIRST XPath that matches wins; every node that XPath
+# returns is written as its own fragment file. Later XPaths in the list are
+# fallbacks for alternative placements, not additive searches. Order them
+# most-specific first so a precise hit beats a loose one.
+#
+# Why '//' descendant paths instead of absolute paths: pushed template files
+# wrap the same elements under <template><entry><config><devices>..., so an
+# absolute /config/devices/... path would miss them. Descendant search finds
+# the element wherever the wrapper put it. PAN-OS config XML has no
+# namespaces, which is what keeps these XPaths simple.
+#
+# Fragment name prefix convention matches the assessment workbook sections:
+#   MGT  = management interface / device-level system settings
+#   AUTH = authentication, accounts, roles
+#   IMP  = interface management profiles + interfaces
+#   NSC  = network security controls (zones, rulebases, address objects)
+#   SVC  = service hardening (TLS, SNMP)
+#   LOG  = logging and forwarding
+# ---------------------------------------------------------------------------
+$FragmentMap = [ordered]@{
+
+    # deviceconfig/system: MGT interface IP, permitted-ip list, service
+    # toggles (disable-http/telnet), DNS/NTP. The single highest-value
+    # fragment for MGT checks.
+    'MGT_deviceconfig-system' = @(
+        "//deviceconfig/system"
+    )
+
+    # setting/management: idle-timeout and admin-lockout (failed-attempts,
+    # lockout-time). NOTE for the analysis layer: if this fragment is
+    # NOT-PRESENT, PAN-OS defaults apply (idle-timeout 60 min, lockout
+    # disabled) - absence here is NOT "unknown".
+    'MGT_setting-management' = @(
+        "//deviceconfig/setting/management"
+    )
+
+    # mgt-config: local admin users (with role bindings), password
+    # complexity policy. Lives at config root, outside <devices>.
+    'AUTH_mgt-config' = @(
+        "//mgt-config"
+    )
+
+    # NOTE on the [entry] predicate used below: several of these tag names
+    # appear BOTH as definition containers (which have <entry> children) and
+    # as bare reference leaves elsewhere, e.g.
+    #   <server-profile>MY-RADIUS</server-profile>   (a reference)
+    # inside an authentication profile. Without the [entry] guard the
+    # reference leaf matches first and a 2-line file gets labelled as the
+    # server-profile definitions - false presence, which is worse than a
+    # missing fragment because it looks like evidence. Caught by the
+    # synthetic test vector. Requiring an <entry> child matches only real
+    # definition containers.
+    # Authentication profiles: shared scope first (most common), then
+    # per-vsys, then anywhere as a last resort.
+    'AUTH_authentication-profile' = @(
+        "//shared/authentication-profile[entry]",
+        "//vsys/entry/authentication-profile[entry]",
+        "//authentication-profile[entry]"
+    )
+
+    # Certificate profiles: used for client-cert admin auth and for
+    # validating TLS peers.
+    'AUTH_certificate-profile' = @(
+        "//shared/certificate-profile[entry]",
+        "//certificate-profile[entry]"
+    )
+
+    # Server profiles: RADIUS/TACACS+/LDAP/SAML/Kerberos targets that
+    # authentication profiles point at.
+    'AUTH_server-profiles' = @(
+        "//shared/server-profile[entry]",
+        "//server-profile[entry]"
+    )
+
+    # Custom admin role definitions (RBAC). Built-in roles do not appear
+    # in config, so NOT-PRESENT here means "no custom roles defined",
+    # not "no roles exist".
+    'AUTH_admin-role' = @(
+        "//shared/admin-role[entry]",
+        "//admin-role[entry]"
+    )
+
+    # Interface management profiles: which services (https/ssh/ping/snmp)
+    # a data-plane interface will answer, plus per-profile permitted-ip.
+    'IMP_interface-mgmt-profiles' = @(
+        "//network/profiles/interface-management-profile"
+    )
+
+    # Full interface tree: needed to see which interfaces BIND a
+    # management profile and what zone/IP they carry. Can be the largest
+    # fragment; that is acceptable because it is data, not policy prose.
+    'IMP_interfaces' = @(
+        "//network/interface"
+    )
+
+    # Zones: map interfaces to trust levels; required to judge whether a
+    # management profile sits on an untrust interface.
+    'NSC_zones' = @(
+        "//vsys/entry/zone[entry]",
+        "//zone[entry]"
+    )
+
+    # Local (on-box) security rulebase. On a Panorama-managed device this
+    # is the middle layer of effective policy: pre-rules, THEN local,
+    # THEN post-rules.
+    'NSC_rulebase-security' = @(
+        "//vsys/entry/rulebase/security",
+        "//rulebase/security"
+    )
+
+    # Panorama-pushed pre-rules (evaluated before local rules). Expected
+    # only in DEVGROUP-classified sources.
+    'NSC_pre-rulebase-security' = @(
+        "//pre-rulebase/security"
+    )
+
+    # Panorama-pushed post-rules (evaluated after local rules).
+    'NSC_post-rulebase-security' = @(
+        "//post-rulebase/security"
+    )
+
+    # NAT rules from any layer: a destination-NAT to a management IP is a
+    # direct exposure path, so all placements are candidates.
+    'NSC_rulebase-nat' = @(
+        "//vsys/entry/rulebase/nat",
+        "//rulebase/nat",
+        "//pre-rulebase/nat",
+        "//post-rulebase/nat"
+    )
+
+    # Address objects: needed to resolve what a rule's source/destination
+    # names actually mean in IP terms.
+    'NSC_address-objects' = @(
+        "//vsys/entry/address[entry]",
+        "//shared/address[entry]",
+        "//address[entry]"
+    )
+
+    # Address groups: same purpose, one indirection deeper.
+    'NSC_address-groups' = @(
+        "//vsys/entry/address-group[entry]",
+        "//shared/address-group[entry]",
+        "//address-group[entry]"
+    )
+
+    # Service objects/groups: a rule's <service> field often names an
+    # object rather than a literal port. Without these definitions the AI
+    # cannot tell whether a rule permitting "SVC-MGMT-ACCESS" covers
+    # tcp/443 or tcp/22. The [entry] guard keeps the <service><member>
+    # references inside rules from matching.
+    'NSC_service-objects' = @(
+        "//vsys/entry/service[entry]",
+        "//shared/service[entry]",
+        "//service[entry]"
+    )
+    'NSC_service-groups' = @(
+        "//vsys/entry/service-group[entry]",
+        "//shared/service-group[entry]",
+        "//service-group[entry]"
+    )
+
+    # SSL/TLS service profiles: min/max TLS version and certificate for
+    # the management web UI.
+    # Definition container only: deviceconfig/system references this
+    # profile by name and that reference must not match here.
+    'SVC_ssl-tls-service-profile' = @(
+        "//shared/ssl-tls-service-profile[entry]",
+        "//ssl-tls-service-profile[entry]"
+    )
+
+    # SNMP settings: version (v2c community vs v3), access config.
+    'SVC_snmp' = @(
+        "//deviceconfig/system/snmp-setting",
+        "//snmp-setting"
+    )
+
+    # Log settings: system/config log forwarding destinations.
+    'LOG_log-settings' = @(
+        "//shared/log-settings",
+        "//log-settings"
+    )
+
+    # Syslog server profiles specifically (subset of log-settings; carved
+    # separately so the LOG extraction prompt gets a focused fragment).
+    'LOG_syslog-profiles' = @(
+        "//shared/log-settings/syslog[entry]",
+        "//syslog[entry]"
+    )
+
+    # Management-plane service routes / service toggles: which source
+    # interface management traffic uses, and the http/telnet disables.
+    'MGT_service-routes' = @(
+        "//deviceconfig/system/route",
+        "//deviceconfig/system/service"
+    )
+
+    # Certificate store: the TLS profile only NAMES its certificate; the
+    # store shows whether that cert is factory self-signed vs CA-issued
+    # and its validity window. Private keys inside entries are covered by
+    # the redaction list ('private-key').
+    # The TLS profile only NAMES its certificate, so the [entry] guard is
+    # essential: without it that name reference masquerades as the store.
+    'SVC_certificates' = @(
+        "//shared/certificate[entry]",
+        "//certificate[entry]"
+    )
+
+    # GlobalProtect portals/gateways: VPN termination and client pools
+    # that may create an indirect path to the management network
+    # (workbook check MGT-04). Absence means no GP configured on-box.
+    'IMP_globalprotect' = @(
+        "//vsys/entry/global-protect",
+        "//global-protect"
+    )
+
+    # High-availability config: HA1 is itself a management-plane path
+    # between peers; its interface, encryption, and backup settings
+    # matter for exposure.
+    'MGT_high-availability' = @(
+        "//deviceconfig/high-availability"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# CountMap: reconciliation counts computed here, locally, as ground truth.
+#
+# Purpose: when the AI later extracts records from a fragment, its record
+# count MUST match these numbers. The AI cannot report "12 interfaces" when
+# this manifest says 14 without the discrepancy being mechanically visible.
+# This is the completeness check that a chat-only AI cannot provide for
+# itself.
+#
+# Unlike FragmentMap, every XPath here is evaluated (no first-match-wins),
+# because a count of zero is itself information worth recording.
+# ---------------------------------------------------------------------------
+$CountMap = [ordered]@{
+    'interfaces_ethernet'      = "//network/interface/ethernet/entry"
+    'interfaces_aggregate'     = "//network/interface/aggregate-ethernet/entry"
+    'interfaces_loopback'      = "//network/interface/loopback/units/entry"
+    'interfaces_tunnel'        = "//network/interface/tunnel/units/entry"
+    'interfaces_vlan'          = "//network/interface/vlan/units/entry"
+    'mgmt_profiles'            = "//network/profiles/interface-management-profile/entry"
+    'admin_users'              = "//mgt-config/users/entry"
+    'admin_roles'              = "//admin-role/entry"
+    'auth_profiles'            = "//authentication-profile/entry"
+    'zones'                    = "//zone/entry"
+    'security_rules_local'     = "//rulebase/security/rules/entry"
+    'security_rules_pre'       = "//pre-rulebase/security/rules/entry"
+    'security_rules_post'      = "//post-rulebase/security/rules/entry"
+    # XPath union operator '|': one count across all three NAT placements.
+    'nat_rules'                = "//rulebase/nat/rules/entry | //pre-rulebase/nat/rules/entry | //post-rulebase/nat/rules/entry"
+    'permitted_ip_mgt'         = "//deviceconfig/system/permitted-ip/entry"
+    'ssl_tls_profiles'         = "//ssl-tls-service-profile/entry"
+    'certificates'             = "//certificate/entry"
+    'service_objects'          = "//service/entry"
+    'service_groups'           = "//service-group/entry"
+    'gp_gateways'              = "//global-protect-gateway/entry"
+}
+
+# ---------------------------------------------------------------------------
+# RedactElements: element TAG NAMES whose text content is replaced with the
+# literal string REDACTED before fragments are written.
+#
+# Matching is by exact element name (case-sensitive per XML rules), so
+# 'community' does NOT cover 'snmp-community-string' - both must be listed.
+# That exact miss was caught by the synthetic test vector; if you find
+# another secret-bearing element in a real fragment, add its tag name here.
+#
+# Known PAN-OS secret carriers covered: local account hashes (phash),
+# generic password/secret fields, LDAP bind-password, RADIUS/TACACS+
+# secret, SNMP v2c community (snmp-community-string) and v3 passwords
+# (authpwd/privpwd), TLS/SSH key material, API keys.
+# ---------------------------------------------------------------------------
+$RedactElements = @(
+    'phash', 'password', 'private-key', 'public-key', 'preshared-key',
+    'bind-password', 'secret', 'api-key', 'auth-password', 'priv-password',
+    'community', 'shared-secret', 'client-key', 'master-key',
+    'snmp-community-string', 'authpwd', 'privpwd'
+)
+
+# ===========================================================================
+# HELPER FUNCTIONS
+# ===========================================================================
+
+# SHA256 of a file. Recorded for every source file and fragment so any
+# artifact that later reaches a report can be tied back to exactly the
+# bytes that were assessed (chain of custody for evidence).
+function Get-Sha256($Path) {
+    (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+}
+
+# Classify a parsed PAN-OS XML document by its structure.
+#
+# Decision logic, in priority order:
+#   1. Contains <template> (as root or under /config) -> pushed-template.
+#      Template files wrap device settings pushed from Panorama.
+#   2. Has device-group markers (device-group element, or pre/post
+#      rulebases) WITHOUT deviceconfig -> pushed-device-group. The
+#      "-and -not hasDeviceconfig" guard matters: a merged running config
+#      can legitimately contain pre/post rulebases AND deviceconfig, and
+#      that file is a local/merged config, not a pushed policy file.
+#   3. Root <config> containing deviceconfig/system or mgt-config ->
+#      local-config (the device's own running configuration).
+#   4. Root <config> with none of the above -> config-unclassified; still
+#      fragmented (prefix UNCLASS) so nothing is silently dropped, but
+#      flagged for human review in the manifest.
+#   5. Anything else -> other (ignored for fragmenting, listed in
+#      manifest).
+function Classify-PanXml {
+    param([xml]$Doc, [string]$FileName)   # FileName kept for future
+                                          # diagnostics; NOT used for
+                                          # classification by design.
+    $root = $Doc.DocumentElement.Name
+    $hasDeviceconfig = $Doc.SelectNodes("//deviceconfig/system").Count -gt 0
+    $hasMgtConfig    = $Doc.SelectNodes("//mgt-config").Count -gt 0
+    $hasTemplate     = ($root -eq 'template') -or ($Doc.SelectNodes("/config/template").Count -gt 0)
+    $hasDg           = ($root -eq 'device-group') -or
+                       ($Doc.SelectNodes("//device-group").Count -gt 0) -or
+                       ($Doc.SelectNodes("//pre-rulebase").Count -gt 0) -or
+                       ($Doc.SelectNodes("//post-rulebase").Count -gt 0)
+
+    if ($hasTemplate)                        { return 'pushed-template' }
+    if ($hasDg -and -not $hasDeviceconfig)   { return 'pushed-device-group' }
+    if ($root -eq 'config' -and ($hasDeviceconfig -or $hasMgtConfig)) { return 'local-config' }
+    if ($root -eq 'config')                  { return 'config-unclassified' }
+    return 'other'
+}
+
+# Replace the text of every secret-bearing element with 'REDACTED'.
+# Operates on the in-memory XmlDocument, so it affects the fragments
+# written afterwards but never the files on disk under _extracted\.
+#
+# XPath note: //*[local-name()='name'] matches the element anywhere in
+# the tree by its local tag name; safer than //name if a config ever
+# carries a namespace. Returns how many values were masked, which the
+# manifest records - a redaction count of 0 on a local config with
+# admin users is itself suspicious and worth a look.
+function Redact-Xml {
+    param([xml]$Doc)
+    $count = 0
+    foreach ($name in $RedactElements) {
+        $nodes = $Doc.SelectNodes("//*[local-name()='$name']")
+        foreach ($n in $nodes) {
+            # InnerText replaces descendants as well as the element's own text.
+            $n.InnerText = 'REDACTED'
+            $count++
+        }
+    }
+    return $count
+}
+
+# Write a single XML node to disk as an indented, self-contained file.
+# Indentation matters: the AI-side verification protocol has the model
+# quote verbatim snippets, and a human then greps for them - pretty-
+# printed XML makes those snippets stable and findable.
+function Save-Fragment {
+    param([System.Xml.XmlNode]$Node, [string]$OutFile)
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.OmitXmlDeclaration = $false
+    $writer = [System.Xml.XmlWriter]::Create($OutFile, $settings)
+    try   { $Node.WriteTo($writer) }
+    finally { $writer.Close() }      # always release the file handle,
+                                     # even if WriteTo throws mid-write
+}
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Gather inputs: a folder (take its top-level archives/XMLs) or one file.
+# '-File' excludes directories; '-in' needs PS3+; '*.tar.gz' is matched by
+# name because its .Extension property is only '.gz'.
+# ---------------------------------------------------------------------------
+if (Test-Path $InputPath -PathType Container) {
+    $inputs = Get-ChildItem -Path $InputPath -File |
+        Where-Object { $_.Extension -in '.tgz', '.gz', '.tar', '.xml' -or $_.Name -like '*.tar.gz' }
+} else {
+    # @(...) forces an array even for a single file, so the foreach below
+    # behaves identically in both cases.
+    $inputs = @(Get-Item $InputPath)
+}
+if (-not $inputs) { throw "No .tgz/.tar.gz/.xml inputs found at $InputPath" }
+
+# -Force: no error if the folder already exists. Out-Null: suppress the
+# DirectoryInfo object New-Item would otherwise print.
+New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+
+foreach ($item in $inputs) {
+    # Device folder name from the bundle filename; the extra -replace
+    # strips the inner '.tar' left over from 'name.tar.gz' so the folder
+    # is 'name', not 'name.tar'.
+    $deviceName = [IO.Path]::GetFileNameWithoutExtension($item.Name) -replace '\.tar$', ''
+    $devOut     = Join-Path $OutputRoot $deviceName
+    $extractDir = Join-Path $devOut '_extracted'   # raw, UNREDACTED
+    $fragDir    = Join-Path $devOut 'fragments'    # upload-safe output
+    foreach ($prior in @($extractDir, $fragDir)) {
+        if (Test-Path $prior) { Remove-Item $prior -Recurse -Force }
+    }
+    foreach ($mf in @('MANIFEST.txt', 'MANIFEST.csv.txt')) {
+        $mp = Join-Path $devOut $mf
+        if (Test-Path $mp) { Remove-Item $mp -Force }
+    }
+    New-Item -ItemType Directory -Force -Path $devOut, $extractDir, $fragDir | Out-Null
+
+    Write-Host "=== $($item.Name) -> $devOut" -ForegroundColor Cyan
+
+    # Typed List instead of PowerShell array += : appends are O(1) and
+    # the manifest can hold thousands of rows without quadratic copying.
+    $manifest = New-Object System.Collections.Generic.List[object]
+    $sourceXmls = @()   # parsed docs that will be fragmented
+
+    # --- Step 1: extract or copy ---------------------------------------
+    if ($item.Extension -eq '.xml') {
+        # Standalone running-config export: no archive to open.
+        Copy-Item $item.FullName -Destination $extractDir
+    } else {
+        # '&' = call operator, runs tar.exe (Windows 10 1803+ ships it).
+        # 2>$null hides tar's stderr chatter; we branch on the exit code.
+        & tar -xzf $item.FullName -C $extractDir 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            # Fallback: some exports are plain (uncompressed) tar despite
+            # the .tgz name; retry without -z before giving up.
+            & tar -xf $item.FullName -C $extractDir
+            if ($LASTEXITCODE -ne 0) { Write-Warning "tar failed on $($item.Name); skipping"; continue }
+        }
+        # Bundles sometimes nest archives one level deep. Extract each
+        # into its own 'nested_<name>' folder (never over the parent, so
+        # name collisions cannot clobber files). One level only, by
+        # design: deeper nesting is unexpected and should be looked at
+        # by a human rather than auto-unpacked.
+        Get-ChildItem $extractDir -Recurse -File |
+            Where-Object { $_.Extension -in '.tgz', '.gz', '.tar' } |
+            ForEach-Object {
+                $nested = Join-Path $extractDir ("nested_" + $_.BaseName)
+                New-Item -ItemType Directory -Force -Path $nested | Out-Null
+                & tar -xzf $_.FullName -C $nested 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    & tar -xf $_.FullName -C $nested 2>$null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Nested file is not a tar ($($_.Name)); left packed"
+                    }
+                }
+            }
+    }
+
+    # --- Steps 2-3: inventory + classify every file by CONTENT ----------
+    $allFiles = Get-ChildItem $extractDir -Recurse -File
+    foreach ($f in $allFiles) {
+        $role = 'non-xml'
+        $rootEl = ''
+        # A file is XML-candidate if its extension says so OR its first
+        # line starts like XML - bundle internals do not always carry
+        # .xml extensions, so extension alone cannot be trusted.
+        if ($f.Extension -eq '.xml' -or (Get-Content $f.FullName -TotalCount 1 -ErrorAction SilentlyContinue) -match '^\s*<\?xml|^\s*<') {
+            try {
+                # -Raw: one string, not a line array; [xml] parses it.
+                [xml]$doc = Get-Content $f.FullName -Raw
+                $rootEl = $doc.DocumentElement.Name
+                $role = Classify-PanXml -Doc $doc -FileName $f.Name
+                # Keep every classified config for fragmenting - including
+                # config-unclassified, so nothing is silently dropped.
+                if ($role -in 'local-config', 'pushed-template', 'pushed-device-group', 'config-unclassified') {
+                    $sourceXmls += [pscustomobject]@{ File = $f; Doc = $doc; Role = $role }
+                }
+            } catch { $role = 'xml-parse-failed' }   # recorded, not fatal
+        }
+        # Every file goes in the manifest regardless of role, with its
+        # path relative to _extracted (Substring strips the prefix), its
+        # line count, and its hash.
+        $manifest.Add([pscustomobject]@{
+            Kind = 'source-file'; Name = $f.FullName.Substring($extractDir.Length + 1)
+            Role = $role; RootElement = $rootEl
+            Lines = (Get-Content $f.FullName -ErrorAction SilentlyContinue | Measure-Object).Count
+            SHA256 = Get-Sha256 $f.FullName; Detail = ''
+        })
+    }
+
+    # Sanity gate: a device bundle with no identifiable local config
+    # means classification failed or the export is not what we think it
+    # is. Warn loudly; the manifest shows what WAS found.
+    if (-not ($sourceXmls | Where-Object Role -eq 'local-config')) {
+        Write-Warning "No local-config identified in $($item.Name). Check manifest before proceeding."
+    }
+
+    # --- Step 4: fragment extraction from every classified source -------
+    foreach ($src in $sourceXmls) {
+        # Role -> fragment filename prefix. This prefix is how source
+        # attribution (template vs local) survives into the AI sessions.
+        $prefix = switch ($src.Role) {
+            'local-config'        { 'LOCAL' }
+            'pushed-template'     { 'TEMPLATE' }
+            'pushed-device-group' { 'DEVGROUP' }
+            default               { 'UNCLASS' }
+        }
+
+        # Step 5 (redaction) runs BEFORE any fragment is written, on the
+        # in-memory document only. _extracted\ files stay untouched.
+        $redactedCount = 0
+        if ($Redact) { $redactedCount = Redact-Xml -Doc $src.Doc }
+
+        foreach ($fragName in $FragmentMap.Keys) {
+            $found = $false
+            foreach ($xpath in $FragmentMap[$fragName]) {
+                $nodes = $src.Doc.SelectNodes($xpath)
+                if ($nodes.Count -gt 0) {
+                    $found = $true
+                    $i = 0
+                    foreach ($node in $nodes) {
+                        # Multiple hits (e.g. one zone block per vsys) get
+                        # _0, _1... suffixes; a single hit gets none.
+                        $suffix = if ($nodes.Count -gt 1) { "_$i" } else { '' }
+                        # Filename note: the backtick in "$prefix`_" ends
+                        # the variable name so PowerShell reads $prefix
+                        # then a literal underscore, not a variable named
+                        # $prefix_. The .xml.txt double extension keeps
+                        # the content XML while satisfying USAI's txt-only
+                        # upload filter.
+                        $outFile = Join-Path $fragDir "$prefix`_$fragName$suffix.xml.txt"
+                        Save-Fragment -Node $node -OutFile $outFile
+                        $manifest.Add([pscustomobject]@{
+                            Kind = 'fragment'; Name = "fragments\$prefix`_$fragName$suffix.xml.txt"
+                            Role = $src.Role; RootElement = $node.Name
+                            # Line count feeds the AI-side truncation
+                            # check: the model must confirm it received
+                            # exactly this many lines.
+                            Lines = (Get-Content $outFile | Measure-Object).Count
+                            SHA256 = Get-Sha256 $outFile
+                            Detail = "xpath=$xpath; from=$($src.File.Name)"
+                        })
+                        $i++
+                    }
+                    # First matching XPath wins for this fragment name;
+                    # remaining XPaths are alternatives, not additions.
+                    break
+                }
+            }
+            if (-not $found) {
+                # Explicit NOT-PRESENT row. This is the tooling-level
+                # version of the four-state presence model: absence is a
+                # recorded claim, never an inference from silence.
+                $manifest.Add([pscustomobject]@{
+                    Kind = 'fragment'; Name = "$prefix`_$fragName"
+                    Role = $src.Role; RootElement = ''
+                    Lines = 0; SHA256 = ''
+                    Detail = 'NOT-PRESENT in this source (all xpaths empty)'
+                })
+            }
+        }
+
+        # --- Step 6a: ground-truth counts for this source ----------------
+        # Counted on the same in-memory doc the fragments came from, so
+        # fragments and counts can never disagree about the source state.
+        # (Redaction masks values only; it cannot change element counts.)
+        foreach ($countName in $CountMap.Keys) {
+            $n = $src.Doc.SelectNodes($CountMap[$countName]).Count
+            $manifest.Add([pscustomobject]@{
+                Kind = 'count'; Name = "$prefix`_$countName"; Role = $src.Role
+                RootElement = ''; Lines = $n; SHA256 = ''
+                Detail = $CountMap[$countName]
+            })
+        }
+        if ($Redact) {
+            # Record how many secret values were masked in this source,
+            # so a human can sanity-check (0 on a local config with
+            # admin users would be suspicious).
+            $manifest.Add([pscustomobject]@{
+                Kind = 'redaction'; Name = "$prefix`_redacted_values"; Role = $src.Role
+                RootElement = ''; Lines = $redactedCount; SHA256 = ''
+                Detail = 'secret-bearing element values masked before fragment write'
+            })
+        }
+    }
+
+    # --- Step 6b: write the two manifests --------------------------------
+    # MANIFEST.csv.txt: machine-readable, stays local (Excel: Data > From
+    # Text/CSV, or rename to .csv). The .txt suffix only exists so it
+    # COULD be uploaded to USAI if ever needed.
+    # MANIFEST.txt: human-readable; this is the copy that goes into the
+    # USAI inventory session (P0) and anchors every reconciliation.
+    $csvPath = Join-Path $devOut 'MANIFEST.csv.txt'
+    $txtPath = Join-Path $devOut 'MANIFEST.txt'
+    $manifest | Export-Csv -Path $csvPath -NoTypeInformation
+
+    # Build the text manifest line by line. '-f' is the .NET format
+    # operator: "{0,-22}" left-pads column 0 to 22 chars, "{1,7}" right-
+    # aligns column 1 to 7 chars - fixed-width output that stays readable
+    # in a chat window.
+    $lines = @()
+    $lines += "PAN-OS bundle split manifest"
+    $lines += "Device bundle : $($item.Name)"
+    $lines += "Source SHA256 : $(Get-Sha256 $item.FullName)"
+    $lines += "Generated     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $lines += "Redaction     : $(if ($Redact) { 'ON' } else { 'OFF - do not upload unredacted fragments' })"
+    $lines += ""
+    $lines += "--- SOURCE FILES (role determined by content, not filename) ---"
+    $manifest | Where-Object Kind -eq 'source-file' | ForEach-Object {
+        $lines += ("{0,-22} {1,7} lines  {2}" -f $_.Role, $_.Lines, $_.Name)
+    }
+    $lines += ""
+    $lines += "--- FRAGMENTS ---"
+    $manifest | Where-Object Kind -eq 'fragment' | ForEach-Object {
+        if ($_.Lines -gt 0) { $lines += ("{0,-55} {1,6} lines" -f $_.Name, $_.Lines) }
+        else                { $lines += ("{0,-55} NOT-PRESENT" -f $_.Name) }
+    }
+    $lines += ""
+    $lines += "--- GROUND-TRUTH COUNTS (AI extraction must reconcile to these) ---"
+    $manifest | Where-Object Kind -eq 'count' | ForEach-Object {
+        $lines += ("{0,-45} {1}" -f $_.Name, $_.Lines)
+    }
+    $manifest | Where-Object Kind -eq 'redaction' | ForEach-Object {
+        $lines += ("{0,-45} {1}" -f $_.Name, $_.Lines)
+    }
+    $lines | Set-Content -Path $txtPath -Encoding UTF8
+
+    # Console summary; backtick-continuations keep the long -f call
+    # readable across lines.
+    Write-Host ("  fragments: {0} written, {1} not present; manifest at {2}" -f `
+        (($manifest | Where-Object { $_.Kind -eq 'fragment' -and $_.Lines -gt 0 }).Count), `
+        (($manifest | Where-Object { $_.Kind -eq 'fragment' -and $_.Lines -eq 0 }).Count), `
+        $txtPath)
+}
+
+Write-Host "`nDone. Review each MANIFEST.txt before uploading anything." -ForegroundColor Green
+Write-Host "Reminder: only redacted fragments and manifests go to USAI, never the raw bundle."
