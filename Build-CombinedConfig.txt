@@ -1,0 +1,1136 @@
+<#
+.SYNOPSIS
+  Turn one PAN-OS device state bundle into one compact, redacted,
+  assessment-scoped text file for a single chat-AI upload.
+
+.DESCRIPTION
+  PowerShell port of build_combined_config.py (the tested reference).
+  Correct when it reproduces tests\golden\FW-TEST_device_state.combined.txt
+  byte-for-byte except the Generated: timestamp line.
+
+  Classification is by PATH, then filename, never by content alone.
+  Unrecognised XML is appended in Appendix B (never dropped).
+  Policy is concatenated in evaluation order, not merged.
+  Multi-vsys: every sp/<name>/sp-config.xml except shared is SP-DG.
+  A single SP-DG keeps the golden labels (DG-PRE / DG-POST); two or
+  more are labeled DG-PRE[vsys1], DG-PRE[vsys2], never merged.
+
+.PARAMETER InputPath
+  A .tgz / .tar.gz file, or a folder of them. Required unless -Fleet.
+
+.PARAMETER OutputPath
+  Folder for <bundle-basename>.combined.txt. Created if missing.
+
+.PARAMETER Full
+  Also render remaining top-level containers under devices/entry,
+  vsys/entry, and shared.
+
+.PARAMETER Fleet
+  Folder of *.combined.txt: write FLEET_SUMMARY.txt instead of
+  building from a bundle. Independent of bundle parsing (v1.1).
+
+.EXAMPLE
+  .\Build-CombinedConfig.ps1 -InputPath .\tests\fixtures\FW-TEST_device_state.tgz -OutputPath .\combined
+
+.EXAMPLE
+  Get-Help .\Build-CombinedConfig.ps1 -Full
+
+.NOTES
+  Windows PowerShell 5.1 and PowerShell 7+. Requires tar.exe.
+  Keep $RedactElements identical to Split-PanBundle.ps1 and
+  Sanitize-DeviceState.ps1. Replacement literal is REDACTED.
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Build')]
+param(
+    [Parameter(ParameterSetName = 'Build')]
+    [string]$InputPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath,
+
+    [Parameter(ParameterSetName = 'Build')]
+    [switch]$Full,
+
+    [Parameter(ParameterSetName = 'Fleet')]
+    [string]$Fleet
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Shared redaction list (union). Keep identical in:
+#   Split-PanBundle.ps1, Sanitize-DeviceState.ps1,
+#   split_pan_bundle.py, build_combined_config.py, Build-CombinedConfig.ps1
+# Literal replacement: REDACTED (uppercase, no brackets).
+$RedactElements = @(
+    'phash', 'password', 'passwd', 'pwd', 'bind-password', 'secret',
+    'shared-secret', 'admin-password', 'auth-password', 'priv-password',
+    'authpwd', 'privpwd', 'community', 'snmp-community-string',
+    'private-key', 'public-key', 'client-key', 'master-key',
+    'certificate-key', 'passphrase', 'preshared-key', 'pre-shared-key',
+    'esp-auth-key', 'ah-auth-key', 'key', 'api-key', 'token',
+    'credential', 'cookie', 'seed'
+)
+
+$SuspectPattern = '(pass|pwd|secret|key|hash|community|cred|token|seed|salt)'
+$SafeTags = @(
+    'authentication-profile', 'auth-profile', 'authentication',
+    'authentication-settings', 'auth-method', 'auth-type', 'authorization',
+    'certificate', 'certificate-profile', 'password-complexity',
+    'credential-enforcement', 'key-size', 'keyid', 'key-lifetime',
+    'keep-alive', 'hash-algorithm', 'certificate-info'
+)
+
+$DevPath = './devices/entry'
+$VsysPath = './devices/entry/vsys/entry'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+# ---------------------------------------------------------------------------
+# Path / IO helpers
+# ---------------------------------------------------------------------------
+
+function Resolve-AbsolutePath([string]$Path) {
+    if ([IO.Path]::IsPathRooted($Path)) {
+        return [IO.Path]::GetFullPath($Path)
+    }
+    return [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Path))
+}
+
+function Get-BundleBaseName([string]$FileName) {
+    $base = $FileName
+    foreach ($ext in @('.tar.gz', '.tgz', '.tar')) {
+        if ($base.ToLower().EndsWith($ext)) {
+            return $base.Substring(0, $base.Length - $ext.Length)
+        }
+    }
+    return [IO.Path]::GetFileNameWithoutExtension($base)
+}
+
+function Test-SafeTarMember([string]$Name) {
+    $norm = $Name.Replace('\', '/')
+    if ($norm.StartsWith('/') -or $norm.Contains(':/')) { return $false }
+    foreach ($part in $norm.Split('/')) {
+        if ($part -eq '..') { return $false }
+    }
+    return $true
+}
+
+function Expand-SafeTar {
+    param([string]$Archive, [string]$Dest)
+    New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    $listing = & tar -tf $Archive 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "tar -tf failed on $Archive"
+    }
+    foreach ($name in $listing) {
+        if (-not (Test-SafeTarMember $name)) {
+            throw "Refusing archive member that escapes the destination: $name"
+        }
+    }
+    & tar -xzf $Archive -C $Dest 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        & tar -xf $Archive -C $Dest
+        if ($LASTEXITCODE -ne 0) { throw "tar extract failed on $Archive" }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# XML helpers (element children only; whitespace text is ignored here)
+# ---------------------------------------------------------------------------
+
+function Get-XmlElements {
+    param($El)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $El) { return ,$list }
+    foreach ($c in $El.ChildNodes) {
+        if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element) { $list.Add($c) }
+    }
+    return ,$list
+}
+
+function Get-XmlDirectText {
+    param($El)
+    if ($null -eq $El) { return '' }
+    foreach ($c in $El.ChildNodes) {
+        if ($c.NodeType -eq [System.Xml.XmlNodeType]::Text -or $c.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
+            if ($null -ne $c.Value) { return $c.Value.Trim() }
+        }
+    }
+    return ''
+}
+
+function Get-XmlText {
+    param($El, [string]$Path = $null)
+    if ($null -eq $El) { return '' }
+    if ($Path) {
+        $El = $El.SelectSingleNode($Path)
+        if ($null -eq $El) { return '' }
+    }
+    return (Get-XmlDirectText $El)
+}
+
+function Get-XmlMembers {
+    param($El, [string]$Path)
+    $out = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $El) { return ,$out }
+    $node = $El.SelectSingleNode($Path)
+    if ($null -eq $node) { return ,$out }
+    foreach ($m in $node.SelectNodes('member')) {
+        $t = Get-XmlDirectText $m
+        if ($t) { $out.Add($t) }
+    }
+    if ($out.Count -eq 0) {
+        $t = Get-XmlDirectText $node
+        if ($t) { $out.Add($t) }
+    }
+    return ,$out
+}
+
+function Get-XmlNames {
+    param($El, [string]$Path)
+    $out = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $El) { return ,$out }
+    $node = $El.SelectSingleNode($Path)
+    if ($null -eq $node) { return ,$out }
+    foreach ($e in $node.SelectNodes('entry')) {
+        $out.Add($e.GetAttribute('name'))
+    }
+    return ,$out
+}
+
+function Get-Canon {
+    param($El)
+    if ($null -eq $El) { return '' }
+    $clone = $El.CloneNode($true)
+    foreach ($n in @($clone.SelectNodes('.//text()'))) {
+        if ($null -ne $n.Value) { $n.Value = $n.Value.Trim() }
+    }
+    return $clone.OuterXml
+}
+
+function ConvertTo-Flatten {
+    param($El)
+    if ($null -eq $El) { return '-' }
+    $kids = Get-XmlElements $El
+    if ($kids.Count -eq 0) {
+        $t = Get-XmlDirectText $El
+        if ($t) { return $t }
+        return '-'
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $kids) {
+        $tag = $k.LocalName
+        if ($tag -eq 'entry') {
+            $nm = $k.GetAttribute('name')
+            if (-not $nm) { $nm = '?' }
+            $parts.Add($nm)
+        }
+        elseif ($tag -eq 'member') {
+            $parts.Add((Get-XmlDirectText $k))
+        }
+        elseif ((Get-XmlElements $k).Count -eq 0) {
+            $tv = Get-XmlDirectText $k
+            if (-not $tv) { $tv = '-' }
+            $parts.Add("$tag=$tv")
+        }
+        else {
+            $parts.Add(('{0}{{{1}}}' -f $tag, (ConvertTo-Flatten $k)))
+        }
+    }
+    return ($parts -join '; ')
+}
+
+function ConvertTo-Cell($Value) {
+    if ($null -eq $Value) { return '-' }
+    if ($Value -is [System.Collections.ICollection] -and $Value.Count -eq 0) { return '-' }
+    $s = [string]$Value
+    if ($s -eq '') { return '-' }
+    return $s
+}
+
+function ConvertTo-EtXml {
+    param($El)
+    $sb = New-Object System.Text.StringBuilder
+    function Escape-Cdata([string]$t) {
+        if ($null -eq $t) { return '' }
+        return (($t -replace '&', '&amp;') -replace '<', '&lt;') -replace '>', '&gt;'
+    }
+    function Escape-Attrib([string]$t) {
+        $x = Escape-Cdata $t
+        $x = $x -replace '"', '&quot;'
+        $x = $x -replace "`n", '&#10;'
+        $x = $x -replace "`r", '&#13;'
+        $x = $x -replace "`t", '&#9;'
+        return $x
+    }
+    function Write-Node($node) {
+        [void]$sb.Append('<').Append($node.LocalName)
+        foreach ($a in $node.Attributes) {
+            if ($a.Prefix -eq 'xmlns' -or $a.LocalName -eq 'xmlns') { continue }
+            [void]$sb.Append(' ').Append($a.Name).Append('="').Append((Escape-Attrib $a.Value)).Append('"')
+        }
+        if ($node.ChildNodes.Count -eq 0) {
+            [void]$sb.Append(' />')
+            return
+        }
+        [void]$sb.Append('>')
+        foreach ($c in $node.ChildNodes) {
+            if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+                Write-Node $c
+            }
+            elseif ($c.NodeType -eq [System.Xml.XmlNodeType]::Text -or
+                    $c.NodeType -eq [System.Xml.XmlNodeType]::CDATA -or
+                    $c.NodeType -eq [System.Xml.XmlNodeType]::Whitespace -or
+                    $c.NodeType -eq [System.Xml.XmlNodeType]::SignificantWhitespace) {
+                [void]$sb.Append((Escape-Cdata $c.Value))
+            }
+        }
+        [void]$sb.Append('</').Append($node.LocalName).Append('>')
+    }
+    Write-Node $El
+    return $sb.ToString()
+}
+
+# ---------------------------------------------------------------------------
+# Classify / redact / merge
+# ---------------------------------------------------------------------------
+
+function Get-BundleRole([string]$Rel) {
+    $r = $Rel.Replace('\', '/').ToLower()
+    $base = [IO.Path]::GetFileName($r)
+    if ($base -eq 'running-config.xml') { return 'LOCAL' }
+    if ($r.StartsWith('template/') -and $base -eq 'template-config.xml') { return 'TEMPLATE' }
+    if ($r.StartsWith('template/')) { return 'TEMPLATE-VARIANT' }
+    if ($r.StartsWith('sp/shared/') -and $base -eq 'sp-config.xml') { return 'SP-SHARED' }
+    if ($r.StartsWith('sp/') -and $base -eq 'sp-config.xml') { return 'SP-DG' }
+    if ($r.StartsWith('sp/')) { return 'SP-VARIANT' }
+    return 'SUPPLEMENTARY'
+}
+
+function Get-SpDgVsys([string]$Rel) {
+    $parts = $Rel.Replace('\', '/').Split('/')
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        if ($parts[$i] -eq 'sp' -and ($i + 1) -lt $parts.Length) {
+            $name = $parts[$i + 1]
+            if ($name -and $name -ne 'shared') { return $name }
+        }
+    }
+    return 'vsys'
+}
+
+function Get-DgLayer([string]$Prefix, [string]$Vsys, [bool]$Multi) {
+    if ($Multi) { return "$Prefix[$Vsys]" }
+    return $Prefix
+}
+
+function Invoke-RedactDoc {
+    param($Root)
+    $n = 0
+    $flagged = @{}
+    foreach ($el in $Root.SelectNodes('//*')) {
+        $tag = $el.LocalName
+        $txt = Get-XmlDirectText $el
+        if (-not $txt) { continue }
+        if ($RedactElements -contains $tag) {
+            # Replace direct text only; keep the element.
+            $replaced = $false
+            foreach ($c in @($el.ChildNodes)) {
+                if ($c.NodeType -eq [System.Xml.XmlNodeType]::Text -or $c.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
+                    $c.Value = 'REDACTED'
+                    $replaced = $true
+                }
+            }
+            if (-not $replaced) { $el.InnerText = 'REDACTED' }
+            $n++
+        }
+        elseif ($tag -match $SuspectPattern -and $SafeTags -notcontains $tag) {
+            if ($flagged.ContainsKey($tag)) { $flagged[$tag]++ } else { $flagged[$tag] = 1 }
+        }
+    }
+    return @{ Count = $n; Flagged = $flagged }
+}
+
+function Get-MergedContainer {
+    param($LocalRoot, $TplRoot, [string]$Path, $Overrides)
+    $lc = $null; $tc = $null
+    if ($null -ne $LocalRoot) { $lc = $LocalRoot.SelectSingleNode($Path) }
+    if ($null -ne $TplRoot) { $tc = $TplRoot.SelectSingleNode($Path) }
+    $lmap = @{}
+    $tmap = @{}
+    $order = New-Object System.Collections.Generic.List[string]
+
+    $keyof = {
+        param($e)
+        $tag = $e.LocalName
+        if ($tag -eq 'entry') { return ($tag + "`0" + $e.GetAttribute('name')) }
+        return ($tag + "`0")
+    }
+
+    if ($null -ne $tc) {
+        foreach ($e in (Get-XmlElements $tc)) {
+            $k = & $keyof $e
+            $tmap[$k] = $e
+            $order.Add($k)
+        }
+    }
+    if ($null -ne $lc) {
+        foreach ($e in (Get-XmlElements $lc)) {
+            $k = & $keyof $e
+            $lmap[$k] = $e
+            if (-not $tmap.ContainsKey($k)) { $order.Add($k) }
+        }
+    }
+
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $order) {
+        $tag, $name = $k.Split([char]0)
+        if (-not $name) { $name = $null }
+        if ($lmap.ContainsKey($k) -and $tmap.ContainsKey($k)) {
+            $drift = (Get-Canon $lmap[$k]) -ne (Get-Canon $tmap[$k])
+            $src = 'LOCAL-OVERRIDE'
+            if (-not $drift) { $src = 'LOCAL-OVERRIDE(no-drift)' }
+            $label = $Path.TrimStart('.', '/') + '/' + $tag
+            if ($name) { $label = $label + '[' + $name + ']' }
+            $Overrides.Add([pscustomobject]@{
+                Path = $label
+                Local = (ConvertTo-Flatten $lmap[$k])
+                Template = (ConvertTo-Flatten $tmap[$k])
+                Drift = $drift
+            })
+            $out.Add([pscustomobject]@{ Tag = $tag; Name = $name; El = $lmap[$k]; Src = $src })
+        }
+        elseif ($lmap.ContainsKey($k)) {
+            $out.Add([pscustomobject]@{ Tag = $tag; Name = $name; El = $lmap[$k]; Src = 'LOCAL' })
+        }
+        else {
+            $out.Add([pscustomobject]@{ Tag = $tag; Name = $name; El = $tmap[$k]; Src = 'TEMPLATE' })
+        }
+    }
+    return ,$out
+}
+
+function Get-MergedEntries {
+    param($LocalRoot, $TplRoot, [string]$Path, $Overrides)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedContainer $LocalRoot $TplRoot $Path $Overrides)) {
+        if ($row.Tag -eq 'entry') { $rows.Add($row) }
+    }
+    return ,$rows
+}
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+function New-OutBuffer {
+    $lines = New-Object System.Collections.Generic.List[string]
+    return [pscustomobject]@{ Lines = $lines }
+}
+
+function Add-Section($Out, [string]$Title, [string]$XPath = '') {
+    $Out.Lines.Add('')
+    $line = "== SECTION: $Title =="
+    if ($XPath) { $line = $line + "   [$XPath]" }
+    $Out.Lines.Add($line)
+}
+
+function Add-Kv($Out, [string]$Key, $Value, [string]$Src = '') {
+    $v = $Value
+    if ($null -eq $v -or [string]$v -eq '') { $v = '-' }
+    $line = "$Key = $v"
+    if ($Src) { $line = $line + "   [SRC:$Src]" }
+    $Out.Lines.Add($line)
+}
+
+function Add-Table($Out, [string[]]$Cols, $Rows) {
+    $Out.Lines.Add(($Cols -join '|'))
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        $Out.Lines.Add('(none)')
+        return
+    }
+    foreach ($r in $Rows) {
+        $cells = New-Object System.Collections.Generic.List[string]
+        foreach ($x in $r) { $cells.Add((ConvertTo-Cell $x)) }
+        $Out.Lines.Add(($cells -join '|'))
+    }
+}
+
+function Add-Raw($Out, [string]$S) { $Out.Lines.Add($S) }
+
+function Get-OutText($Out) {
+    return (($Out.Lines -join "`n") + "`n")
+}
+
+function Write-DeviceSections {
+    param($L, $T, $Overrides, $Out, [bool]$DoFull)
+
+    Add-Section $Out 'SYSTEM' 'deviceconfig/system'
+    foreach ($row in (Get-MergedContainer $L $T ($DevPath + '/deviceconfig/system') $Overrides)) {
+        if (($row.Tag -eq 'snmp-setting' -or $row.Tag -eq 'route') -and -not $DoFull) { continue }
+        Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src
+    }
+
+    Add-Section $Out 'MANAGEMENT SETTINGS' 'deviceconfig/setting/management'
+    $rows = Get-MergedContainer $L $T ($DevPath + '/deviceconfig/setting/management') $Overrides
+    if ($rows.Count -eq 0) {
+        Add-Raw $Out '(absent: PAN-OS defaults apply: idle-timeout 60 min, lockout disabled)'
+    }
+    foreach ($row in $rows) { Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src }
+
+    Add-Section $Out 'SERVICE ROUTES' 'deviceconfig/system/route'
+    $rows = Get-MergedContainer $L $T ($DevPath + '/deviceconfig/system/route') $Overrides
+    if ($rows.Count -eq 0) { Add-Raw $Out '(none)' }
+    foreach ($row in $rows) { Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src }
+
+    Add-Section $Out 'HIGH AVAILABILITY' 'deviceconfig/high-availability'
+    $rows = Get-MergedContainer $L $T ($DevPath + '/deviceconfig/high-availability') $Overrides
+    if ($rows.Count -eq 0) { Add-Raw $Out '(absent: not in an HA pair, or HA not configured)' }
+    foreach ($row in $rows) { Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src }
+
+    Add-Section $Out 'ADMIN USERS' 'mgt-config/users'
+    $adminRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './mgt-config/users' $Overrides)) {
+        $perm = $row.El.SelectSingleNode('permissions/role-based')
+        $role = '-'
+        if ($null -ne $perm) {
+            $pc = Get-XmlElements $perm
+            if ($pc.Count -gt 0) {
+                $c = $pc[0]
+                if ((Get-XmlElements $c).Count -eq 0) { $role = $c.LocalName }
+                else { $role = "$($c.LocalName):$(ConvertTo-Flatten $c)" }
+            }
+        }
+        $ph = Get-XmlText $row.El 'phash'
+        if (-not $ph) { $ph = '-' }
+        $adminRows.Add(@($row.Name, $role, (Get-XmlText $row.El 'authentication-profile'), $ph, $row.Src))
+    }
+    Add-Table $Out @('NAME', 'ROLE', 'AUTH-PROFILE', 'PHASH', 'SRC') $adminRows
+
+    Add-Section $Out 'PASSWORD COMPLEXITY' 'mgt-config/password-complexity'
+    $rows = Get-MergedContainer $L $T './mgt-config/password-complexity' $Overrides
+    if ($rows.Count -eq 0) { Add-Raw $Out '(absent: complexity not enforced)' }
+    foreach ($row in $rows) { Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src }
+
+    Add-Section $Out 'ADMIN ROLES (custom)' 'shared/admin-role'
+    $roleRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/admin-role' $Overrides)) {
+        $sum = ConvertTo-Flatten $row.El
+        if ($sum.Length -gt 200) { $sum = $sum.Substring(0, 200) }
+        $roleRows.Add(@($row.Name, $sum, $row.Src))
+    }
+    Add-Table $Out @('NAME', 'SUMMARY', 'SRC') $roleRows
+
+    Add-Section $Out 'AUTHENTICATION PROFILES' 'shared/authentication-profile'
+    $apRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/authentication-profile' $Overrides)) {
+        $meth = $row.El.SelectSingleNode('method')
+        $mname = '-'
+        $srv = ''
+        if ($null -ne $meth) {
+            $mc = Get-XmlElements $meth
+            if ($mc.Count -gt 0) {
+                $mname = $mc[0].LocalName
+                $srv = Get-XmlText $meth ($mname + '/server-profile')
+            }
+        }
+        $apRows.Add(@($row.Name, $mname, $srv, (ConvertTo-Flatten ($row.El.SelectSingleNode('lockout'))), $row.Src))
+    }
+    Add-Table $Out @('NAME', 'METHOD', 'SERVER-PROFILE', 'LOCKOUT', 'SRC') $apRows
+
+    Add-Section $Out 'SERVER PROFILES' 'shared/server-profile'
+    $spRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedContainer $L $T './shared/server-profile' $Overrides)) {
+        foreach ($ent in $row.El.SelectNodes('entry')) {
+            $det = ConvertTo-Flatten $ent
+            if ($det.Length -gt 200) { $det = $det.Substring(0, 200) }
+            $spRows.Add(@($ent.GetAttribute('name'), $row.Tag, $det, $row.Src))
+        }
+    }
+    Add-Table $Out @('NAME', 'TYPE', 'DETAIL', 'SRC') $spRows
+
+    Add-Section $Out 'CERTIFICATE PROFILES' 'shared/certificate-profile'
+    $cpRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/certificate-profile' $Overrides)) {
+        $det = ConvertTo-Flatten $row.El
+        if ($det.Length -gt 200) { $det = $det.Substring(0, 200) }
+        $cpRows.Add(@($row.Name, $det, $row.Src))
+    }
+    Add-Table $Out @('NAME', 'DETAIL', 'SRC') $cpRows
+
+    $zoneOf = @{}
+    $zones = Get-MergedEntries $L $T ($VsysPath + '/zone') $Overrides
+    foreach ($z in $zones) {
+        $ifaces = New-Object System.Collections.Generic.List[string]
+        foreach ($p in @('network/layer3', 'network/layer2', 'network/virtual-wire', 'network/tap')) {
+            foreach ($m in (Get-XmlMembers $z.El $p)) { $ifaces.Add($m) }
+        }
+        foreach ($iface in $ifaces) { $zoneOf[$iface] = $z.Name }
+    }
+
+    Add-Section $Out 'INTERFACES' 'network/interface'
+    $ifRows = New-Object System.Collections.Generic.List[object]
+    foreach ($itype in @('ethernet', 'aggregate-ethernet', 'loopback', 'tunnel', 'vlan')) {
+        $base = $DevPath + '/network/interface/' + $itype
+        foreach ($path in @($base, ($base + '/units'))) {
+            foreach ($row in (Get-MergedEntries $L $T $path $Overrides)) {
+                $l3 = $row.El.SelectSingleNode('layer3')
+                if ($null -eq $l3) { $l3 = $row.El }
+                $ips = (Get-XmlNames $l3 'ip') -join ';'
+                if (-not $ips) { $ips = Get-XmlText $l3 'ip' }
+                if (-not $ips) { $ips = '-' }
+                $prof = Get-XmlText $l3 'interface-management-profile'
+                if (-not $prof) { $prof = '-' }
+                $zn = '-'
+                if ($zoneOf.ContainsKey($row.Name)) { $zn = $zoneOf[$row.Name] }
+                $ifRows.Add(@($row.Name, $itype, $ips, $zn, $prof, $row.Src))
+                if ($null -ne $l3) {
+                    foreach ($se in $l3.SelectNodes('units/entry')) {
+                        $sn = $se.GetAttribute('name')
+                        $sips = (Get-XmlNames $se 'ip') -join ';'
+                        if (-not $sips) { $sips = '-' }
+                        $sprof = Get-XmlText $se 'interface-management-profile'
+                        if (-not $sprof) { $sprof = '-' }
+                        $szn = '-'
+                        if ($zoneOf.ContainsKey($sn)) { $szn = $zoneOf[$sn] }
+                        $ifRows.Add(@($sn, ($itype + '-sub'), $sips, $szn, $sprof, $row.Src))
+                    }
+                }
+            }
+        }
+    }
+    Add-Table $Out @('NAME', 'TYPE', 'IP', 'ZONE', 'MGMT-PROFILE', 'SRC') $ifRows
+
+    Add-Section $Out 'INTERFACE MANAGEMENT PROFILES' 'network/profiles/interface-management-profile'
+    $mpRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T ($DevPath + '/network/profiles/interface-management-profile') $Overrides)) {
+        $svcs = New-Object System.Collections.Generic.List[string]
+        foreach ($c in (Get-XmlElements $row.El)) {
+            if ((Get-XmlElements $c).Count -eq 0 -and (Get-XmlDirectText $c) -eq 'yes') {
+                $svcs.Add($c.LocalName)
+            }
+        }
+        $svc = $svcs -join ';'
+        if (-not $svc) { $svc = '-' }
+        $pip = (Get-XmlNames $row.El 'permitted-ip') -join ';'
+        if (-not $pip) { $pip = 'ABSENT(=all sources)' }
+        $mpRows.Add(@($row.Name, $svc, $pip, $row.Src))
+    }
+    Add-Table $Out @('NAME', 'SERVICES-ENABLED', 'PERMITTED-IP', 'SRC') $mpRows
+
+    Add-Section $Out 'ZONES' 'vsys/entry/zone'
+    $zRows = New-Object System.Collections.Generic.List[object]
+    foreach ($z in $zones) {
+        $ifaces = New-Object System.Collections.Generic.List[string]
+        foreach ($p in @('network/layer3', 'network/layer2', 'network/virtual-wire')) {
+            foreach ($m in (Get-XmlMembers $z.El $p)) { $ifaces.Add($m) }
+        }
+        $zp = Get-XmlText $z.El 'network/zone-protection-profile'
+        if (-not $zp) { $zp = '-' }
+        $zRows.Add(@($z.Name, ($ifaces -join ';'), $zp, $z.Src))
+    }
+    Add-Table $Out @('NAME', 'INTERFACES', 'ZONE-PROTECTION', 'SRC') $zRows
+
+    Add-Section $Out 'ZONE PROTECTION PROFILES' 'network/profiles/zone-protection-profile'
+    $zpRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T ($DevPath + '/network/profiles/zone-protection-profile') $Overrides)) {
+        $sum = ConvertTo-Flatten $row.El
+        if ($sum.Length -gt 200) { $sum = $sum.Substring(0, 200) }
+        $zpRows.Add(@($row.Name, $sum, $row.Src))
+    }
+    Add-Table $Out @('NAME', 'SUMMARY', 'SRC') $zpRows
+
+    Add-Section $Out 'STATIC ROUTES' 'network/virtual-router/*/routing-table/ip/static-route'
+    $rtRows = New-Object System.Collections.Generic.List[object]
+    foreach ($vr in (Get-MergedEntries $L $T ($DevPath + '/network/virtual-router') $Overrides)) {
+        foreach ($r in $vr.El.SelectNodes('routing-table/ip/static-route/entry')) {
+            $nh = $r.SelectSingleNode('nexthop')
+            $nhv = '-'
+            if ($null -ne $nh) { $nhv = ConvertTo-Flatten $nh }
+            $iface = Get-XmlText $r 'interface'
+            if (-not $iface) { $iface = '-' }
+            $rtRows.Add(@($vr.Name, $r.GetAttribute('name'), (Get-XmlText $r 'destination'), $nhv, $iface, $vr.Src))
+        }
+    }
+    Add-Table $Out @('VR', 'NAME', 'DESTINATION', 'NEXTHOP', 'INTERFACE', 'SRC') $rtRows
+
+    Add-Section $Out 'SSL/TLS SERVICE PROFILES' 'shared/ssl-tls-service-profile'
+    $tlsRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/ssl-tls-service-profile' $Overrides)) {
+        $tlsRows.Add(@(
+            $row.Name,
+            (Get-XmlText $row.El 'protocol-settings/min-version'),
+            (Get-XmlText $row.El 'protocol-settings/max-version'),
+            (Get-XmlText $row.El 'certificate'),
+            $row.Src
+        ))
+    }
+    Add-Table $Out @('NAME', 'MIN-VERSION', 'MAX-VERSION', 'CERTIFICATE', 'SRC') $tlsRows
+
+    Add-Section $Out 'CERTIFICATES (config store)' 'shared/certificate'
+    $certRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/certificate' $Overrides)) {
+        $pk = '-'
+        if ($null -ne $row.El.SelectSingleNode('private-key')) { $pk = 'present(REDACTED)' }
+        $certRows.Add(@(
+            $row.Name,
+            (Get-XmlText $row.El 'subject'),
+            (Get-XmlText $row.El 'issuer'),
+            (Get-XmlText $row.El 'not-valid-after'),
+            $pk,
+            $row.Src
+        ))
+    }
+    Add-Table $Out @('NAME', 'SUBJECT', 'ISSUER', 'NOT-AFTER', 'PRIVATE-KEY', 'SRC') $certRows
+
+    Add-Section $Out 'SNMP' 'deviceconfig/system/snmp-setting'
+    $rows = Get-MergedContainer $L $T ($DevPath + '/deviceconfig/system/snmp-setting') $Overrides
+    if ($rows.Count -eq 0) { Add-Raw $Out '(absent: SNMP not configured)' }
+    foreach ($row in $rows) { Add-Kv $Out $row.Tag (ConvertTo-Flatten $row.El) $row.Src }
+
+    Add-Section $Out 'LOG SETTINGS' 'shared/log-settings'
+    foreach ($row in (Get-MergedContainer $L $T './shared/log-settings' $Overrides)) {
+        if ($row.Tag -eq 'syslog') { continue }
+        $v = ConvertTo-Flatten $row.El
+        if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
+        Add-Kv $Out $row.Tag $v $row.Src
+    }
+
+    Add-Section $Out 'SYSLOG SERVER PROFILES' 'shared/log-settings/syslog'
+    $sysRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in (Get-MergedEntries $L $T './shared/log-settings/syslog' $Overrides)) {
+        foreach ($srv in $row.El.SelectNodes('server/entry')) {
+            $sysRows.Add(@(
+                $row.Name,
+                $srv.GetAttribute('name'),
+                (Get-XmlText $srv 'server'),
+                (Get-XmlText $srv 'transport'),
+                (Get-XmlText $srv 'port'),
+                (Get-XmlText $srv 'format'),
+                $row.Src
+            ))
+        }
+    }
+    Add-Table $Out @('PROFILE', 'SERVER', 'ADDRESS', 'TRANSPORT', 'PORT', 'FORMAT', 'SRC') $sysRows
+
+    Add-Section $Out 'GLOBALPROTECT' 'vsys/entry/global-protect'
+    $rows = Get-MergedContainer $L $T ($VsysPath + '/global-protect') $Overrides
+    if ($rows.Count -eq 0) { Add-Raw $Out '(absent: no GlobalProtect configured on-box)' }
+    foreach ($row in $rows) {
+        $v = ConvertTo-Flatten $row.El
+        if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
+        Add-Kv $Out $row.Tag $v $row.Src
+    }
+
+    foreach ($pair in @(
+        @('ADDRESS OBJECTS', ($VsysPath + '/address')),
+        @('ADDRESS GROUPS', ($VsysPath + '/address-group')),
+        @('SERVICE OBJECTS', ($VsysPath + '/service')),
+        @('SERVICE GROUPS', ($VsysPath + '/service-group'))
+    )) {
+        $title = $pair[0]; $path = $pair[1]
+        Add-Section $Out $title ($path.Replace($DevPath + '/', ''))
+        $oRows = New-Object System.Collections.Generic.List[object]
+        foreach ($row in (Get-MergedEntries $L $T $path $Overrides)) {
+            $oRows.Add(@($row.Name, (ConvertTo-Flatten $row.El), $row.Src))
+        }
+        Add-Table $Out @('NAME', 'VALUE', 'SRC') $oRows
+    }
+}
+
+function Write-FullRemaining {
+    param($L, $T, $Overrides, $Out)
+    $skipDev = @('deviceconfig', 'network', 'vsys')
+    $skipVsys = @('zone', 'global-protect', 'address', 'address-group', 'service', 'service-group', 'rulebase')
+    $skipShared = @('admin-role', 'authentication-profile', 'server-profile', 'certificate-profile',
+        'ssl-tls-service-profile', 'certificate', 'log-settings')
+    $blocks = @(
+        @('FULL: REMAINING devices/entry', $DevPath, $skipDev),
+        @('FULL: REMAINING vsys/entry', $VsysPath, $skipVsys),
+        @('FULL: REMAINING shared', './shared', $skipShared)
+    )
+    foreach ($b in $blocks) {
+        Add-Section $Out $b[0] ($b[1].TrimStart('.', '/'))
+        $shown = $false
+        foreach ($row in (Get-MergedContainer $L $T $b[1] $Overrides)) {
+            if ($b[2] -contains $row.Tag) { continue }
+            $v = ConvertTo-Flatten $row.El
+            if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
+            Add-Kv $Out $row.Tag $v $row.Src
+            $shown = $true
+        }
+        if (-not $shown) { Add-Raw $Out '(none)' }
+    }
+}
+
+function Get-PolicyLayers($SpShared, $SpDgs, $L, [string]$Kind) {
+    $multi = $SpDgs.Count -gt 1
+    $list = New-Object System.Collections.Generic.List[object]
+    $list.Add([pscustomobject]@{ Label = 'SHARED-PRE'; Root = $SpShared; Path = ".//pre-rulebase/$Kind/rules" })
+    foreach ($dg in $SpDgs) {
+        $list.Add([pscustomobject]@{ Label = (Get-DgLayer 'DG-PRE' $dg.Vsys $multi); Root = $dg.Root; Path = ".//pre-rulebase/$Kind/rules" })
+    }
+    $list.Add([pscustomobject]@{ Label = 'LOCAL'; Root = $L; Path = ".//rulebase/$Kind/rules" })
+    foreach ($dg in $SpDgs) {
+        $list.Add([pscustomobject]@{ Label = (Get-DgLayer 'DG-POST' $dg.Vsys $multi); Root = $dg.Root; Path = ".//post-rulebase/$Kind/rules" })
+    }
+    $list.Add([pscustomobject]@{ Label = 'SHARED-POST'; Root = $SpShared; Path = ".//post-rulebase/$Kind/rules" })
+    return ,$list
+}
+
+function Write-PolicySections {
+    param($L, $SpShared, $SpDgs, $Out)
+    Add-Section $Out 'SECURITY POLICY (evaluation order; first match wins)'
+    Add-Raw $Out '# LAYER order: SHARED-PRE, DG-PRE, LOCAL, DG-POST, SHARED-POST'
+    Add-Raw $Out "# Multiple members ';'-separated. '-' = absent."
+    $secCols = @('LAYER', 'ORDER', 'NAME', 'FROM', 'TO', 'SOURCE', 'DEST', 'APP', 'SERVICE', 'ACTION', 'DISABLED')
+    $secRows = New-Object System.Collections.Generic.List[object]
+    $counts = [ordered]@{}
+    if ($SpDgs.Count -le 1) {
+        foreach ($lab in @('SHARED-PRE', 'DG-PRE', 'LOCAL', 'DG-POST', 'SHARED-POST')) {
+            $counts[$lab] = 0
+        }
+    }
+    foreach ($layer in (Get-PolicyLayers $SpShared $SpDgs $L 'security')) {
+        $ents = @()
+        if ($null -ne $layer.Root) {
+            $node = $layer.Root.SelectSingleNode($layer.Path)
+            if ($null -ne $node) { $ents = @($node.SelectNodes('entry')) }
+        }
+        if ($counts.Contains($layer.Label)) { $counts[$layer.Label] += $ents.Count }
+        else { $counts[$layer.Label] = $ents.Count }
+        $i = 0
+        foreach ($e in $ents) {
+            $g = {
+                param($t)
+                $m = (Get-XmlMembers $e $t) -join ';'
+                if ($m) { return $m }
+                return '-'
+            }
+            $secRows.Add(@(
+                $layer.Label, $i, $e.GetAttribute('name'),
+                (& $g 'from'), (& $g 'to'), (& $g 'source'), (& $g 'destination'),
+                (& $g 'application'), (& $g 'service'),
+                (Get-XmlText $e 'action'), (Get-XmlText $e 'disabled')
+            ))
+            $i++
+        }
+    }
+    Add-Table $Out $secCols $secRows
+
+    Add-Section $Out 'NAT POLICY (evaluation order)'
+    $natCols = @('LAYER', 'ORDER', 'NAME', 'FROM', 'TO', 'SOURCE', 'DEST', 'SERVICE', 'SRC-XLATE', 'DST-XLATE', 'DISABLED')
+    $natRows = New-Object System.Collections.Generic.List[object]
+    if ($SpDgs.Count -le 1) {
+        foreach ($lab in @('SHARED-PRE', 'DG-PRE', 'LOCAL', 'DG-POST', 'SHARED-POST')) {
+            $counts['NAT-' + $lab] = 0
+        }
+    }
+    foreach ($layer in (Get-PolicyLayers $SpShared $SpDgs $L 'nat')) {
+        $ents = @()
+        if ($null -ne $layer.Root) {
+            $node = $layer.Root.SelectSingleNode($layer.Path)
+            if ($null -ne $node) { $ents = @($node.SelectNodes('entry')) }
+        }
+        $nk = 'NAT-' + $layer.Label
+        if ($counts.Contains($nk)) { $counts[$nk] += $ents.Count } else { $counts[$nk] = $ents.Count }
+        $i = 0
+        foreach ($e in $ents) {
+            $g = {
+                param($t)
+                $m = (Get-XmlMembers $e $t) -join ';'
+                if ($m) { return $m }
+                return '-'
+            }
+            $sx = ConvertTo-Flatten ($e.SelectSingleNode('source-translation'))
+            $dx = ConvertTo-Flatten ($e.SelectSingleNode('destination-translation'))
+            if ($sx.Length -gt 80) { $sx = $sx.Substring(0, 80) }
+            if ($dx.Length -gt 80) { $dx = $dx.Substring(0, 80) }
+            $natRows.Add(@(
+                $layer.Label, $i, $e.GetAttribute('name'),
+                (& $g 'from'), (& $g 'to'), (& $g 'source'), (& $g 'destination'), (& $g 'service'),
+                $sx, $dx, (Get-XmlText $e 'disabled')
+            ))
+            $i++
+        }
+    }
+    Add-Table $Out $natCols $natRows
+    return $counts
+}
+
+function Get-UnionCount($L, $T, [string]$Path) {
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in @($L, $T)) {
+        if ($null -eq $r) { continue }
+        foreach ($e in $r.SelectNodes($Path)) {
+            $nm = $e.GetAttribute('name')
+            if (-not $nm) { $nm = [string]$e.GetHashCode() }
+            [void]$set.Add($nm)
+        }
+    }
+    return $set.Count
+}
+
+function Get-PathCount($Root, [string]$Path) {
+    if ($null -eq $Root) { return 0 }
+    return @($Root.SelectNodes($Path)).Count
+}
+
+function Get-CountBlock($L, $T, $PolicyCounts) {
+    $c = New-Object System.Collections.Generic.List[object]
+    $c.Add(@('interfaces_ethernet', (Get-UnionCount $L $T ($DevPath + '/network/interface/ethernet/entry'))))
+    $other = (Get-UnionCount $L $T ($DevPath + '/network/interface/aggregate-ethernet/entry')) +
+             (Get-UnionCount $L $T ($DevPath + '/network/interface/loopback/units/entry')) +
+             (Get-UnionCount $L $T ($DevPath + '/network/interface/tunnel/units/entry')) +
+             (Get-UnionCount $L $T ($DevPath + '/network/interface/vlan/units/entry'))
+    $c.Add(@('interfaces_other', $other))
+    $c.Add(@('mgmt_profiles', (Get-UnionCount $L $T ($DevPath + '/network/profiles/interface-management-profile/entry'))))
+    $c.Add(@('zones', (Get-UnionCount $L $T ($VsysPath + '/zone/entry'))))
+    $c.Add(@('admin_users', (Get-UnionCount $L $T './mgt-config/users/entry')))
+    $c.Add(@('auth_profiles', (Get-UnionCount $L $T './shared/authentication-profile/entry')))
+    $c.Add(@('permitted_ip_mgt_LOCAL', (Get-PathCount $L ($DevPath + '/deviceconfig/system/permitted-ip/entry'))))
+    $c.Add(@('permitted_ip_mgt_TEMPLATE', (Get-PathCount $T ($DevPath + '/deviceconfig/system/permitted-ip/entry'))))
+    $c.Add(@('address_objects', (Get-UnionCount $L $T ($VsysPath + '/address/entry'))))
+    $c.Add(@('service_objects', (Get-UnionCount $L $T ($VsysPath + '/service/entry'))))
+    $c.Add(@('tls_profiles', (Get-UnionCount $L $T './shared/ssl-tls-service-profile/entry')))
+    foreach ($key in $PolicyCounts.Keys) {
+        $c.Add(@(('rules_' + $key), [int]$PolicyCounts[$key]))
+    }
+    return ,$c
+}
+
+# ---------------------------------------------------------------------------
+# Bundle load / build
+# ---------------------------------------------------------------------------
+
+function Import-BundleXml {
+    param([string]$BundlePath, [string]$WorkDir)
+    Expand-SafeTar -Archive $BundlePath -Dest $WorkDir
+    $files = @{}
+    Get-ChildItem -LiteralPath $WorkDir -Recurse -File | ForEach-Object {
+        if (-not $_.Name.ToLower().EndsWith('.xml')) { return }
+        $rel = $_.FullName.Substring($WorkDir.Length).TrimStart('\', '/').Replace('\', '/')
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.PreserveWhitespace = $true
+        try { $doc.Load($_.FullName) } catch { return }
+        $role = Get-BundleRole $rel
+        if (-not $files.ContainsKey($role)) {
+            $files[$role] = New-Object System.Collections.Generic.List[object]
+        }
+        $files[$role].Add([pscustomobject]@{ Rel = $rel; Root = $doc.DocumentElement; Doc = $doc })
+    }
+    return $files
+}
+
+function Build-CombinedFile {
+    param([string]$Bundle, [string]$OutDir, [bool]$DoFull)
+    $base = Get-BundleBaseName ([IO.Path]::GetFileName($Bundle))
+    $work = Join-Path $OutDir ('_work_' + $base)
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+    try {
+        $files = Import-BundleXml -BundlePath $Bundle -WorkDir $work
+        $one = {
+            param($role)
+            if ($files.ContainsKey($role) -and $files[$role].Count -gt 0) { return $files[$role][0].Root }
+            return $null
+        }
+        $L = & $one 'LOCAL'
+        $T = & $one 'TEMPLATE'
+        $SPS = & $one 'SP-SHARED'
+        $spDgs = New-Object System.Collections.Generic.List[object]
+        if ($files.ContainsKey('SP-DG')) {
+            foreach ($item in $files['SP-DG']) {
+                $spDgs.Add([pscustomobject]@{ Vsys = (Get-SpDgVsys $item.Rel); Root = $item.Root })
+            }
+        }
+        $spDgs = [System.Collections.Generic.List[object]]@($spDgs | Sort-Object Vsys)
+        $SPD = $null
+        if ($spDgs.Count -gt 0) { $SPD = $spDgs[0].Root }
+
+        $redTotal = 0
+        $flagged = @{}
+        foreach ($role in @('LOCAL', 'TEMPLATE', 'SP-SHARED', 'SP-DG', 'SUPPLEMENTARY')) {
+            if (-not $files.ContainsKey($role)) { continue }
+            foreach ($item in $files[$role]) {
+                $r = Invoke-RedactDoc $item.Root
+                $redTotal += $r.Count
+                foreach ($k in $r.Flagged.Keys) {
+                    if ($flagged.ContainsKey($k)) { $flagged[$k] += $r.Flagged[$k] } else { $flagged[$k] = $r.Flagged[$k] }
+                }
+            }
+        }
+
+        $overrides = New-Object System.Collections.Generic.List[object]
+        $body = New-OutBuffer
+        Write-DeviceSections $L $T $overrides $body $DoFull
+        if ($DoFull) { Write-FullRemaining $L $T $overrides $body }
+        $pcounts = Write-PolicySections $L $SPS $spDgs $body
+
+        Add-Section $body 'APPENDIX A: LOCAL OVERRIDES OF TEMPLATE VALUES'
+        Add-Raw $body '# Objects present in BOTH running-config and template-config. Local value is effective.'
+        Add-Raw $body '# DRIFT=yes means the values differ (finding). DRIFT=no means identical but unmanaged by Panorama.'
+        $aRows = New-Object System.Collections.Generic.List[object]
+        foreach ($o in $overrides) {
+            $lv = $o.Local; if ($lv.Length -gt 150) { $lv = $lv.Substring(0, 150) }
+            $tv = $o.Template; if ($tv.Length -gt 150) { $tv = $tv.Substring(0, 150) }
+            $d = 'no'; if ($o.Drift) { $d = 'yes' }
+            $aRows.Add(@($o.Path, $lv, $tv, $d))
+        }
+        Add-Table $body @('OBJECT', 'LOCAL-VALUE', 'TEMPLATE-VALUE', 'DRIFT') $aRows
+
+        Add-Section $body 'APPENDIX B: SUPPLEMENTARY FILES (verbatim, redacted)'
+        if ($files.ContainsKey('SUPPLEMENTARY')) {
+            foreach ($item in $files['SUPPLEMENTARY']) {
+                Add-Raw $body ("--- {0} ---" -f $item.Rel)
+                Add-Raw $body ((ConvertTo-EtXml $item.Root).Trim())
+            }
+        }
+
+        $hostname = Get-XmlText $L ($DevPath + '/deviceconfig/system/hostname')
+        if (-not $hostname) { $hostname = Get-XmlText $T ($DevPath + '/deviceconfig/system/hostname') }
+        if (-not $hostname) { $hostname = $base }
+        $counts = Get-CountBlock $L $T $pcounts
+
+        $yesNo = {
+            param($x)
+            if ($null -ne $x) { return 'yes' }
+            return 'MISSING'
+        }
+        $flagStr = 'none'
+        if ($flagged.Count -gt 0) {
+            $parts = New-Object System.Collections.Generic.List[string]
+            foreach ($k in ($flagged.Keys | Sort-Object)) { $parts.Add(('{0}({1})' -f $k, $flagged[$k])) }
+            $flagStr = $parts -join ', '
+        }
+        $scope = 'assessment'
+        if ($DoFull) { $scope = 'FULL' }
+
+        $hdr = New-OutBuffer
+        Add-Raw $hdr ('#' * 72)
+        Add-Raw $hdr ("# PAN-OS COMBINED DEVICE CONFIGURATION  ($scope scope)")
+        Add-Raw $hdr ("# Device: {0} | Bundle: {1} | Generated: {2}" -f $hostname, [IO.Path]::GetFileName($Bundle), (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+        Add-Raw $hdr ("# Sources merged: LOCAL={0} TEMPLATE={1} SP-SHARED={2} SP-DG={3}" -f (& $yesNo $L), (& $yesNo $T), (& $yesNo $SPS), (& $yesNo $SPD))
+        Add-Raw $hdr ("# Redaction: {0} secret values masked. Discovery flagged (review): {1}" -f $redTotal, $flagStr)
+        Add-Raw $hdr '#'
+        Add-Raw $hdr '# GROUND-TRUTH COUNTS (state these back before any analysis; mismatch = truncated upload)'
+        foreach ($pair in $counts) {
+            Add-Raw $hdr ('#   {0,-32} {1}' -f $pair[0], $pair[1])
+        }
+        Add-Raw $hdr '#'
+        Add-Raw $hdr '# HOW TO READ'
+        Add-Raw $hdr "#   Sections start with '== SECTION: name ==' and cite the source XPath."
+        Add-Raw $hdr '#   [SRC:TEMPLATE]        value pushed from Panorama, not overridden locally'
+        Add-Raw $hdr '#   [SRC:LOCAL]           locally configured, not managed by Panorama'
+        Add-Raw $hdr '#   [SRC:LOCAL-OVERRIDE]  local value overrides a template value (see Appendix A)'
+        Add-Raw $hdr '#   Policy is listed in evaluation order; first match wins. Never assume a rule'
+        Add-Raw $hdr '#   protects the MGT interface: security policy is not evaluated for MGT traffic.'
+        Add-Raw $hdr '#   A management profile with no permitted-ip allows ALL sources.'
+        Add-Raw $hdr '#   An interface with NO management profile denies all management access.'
+        Add-Raw $hdr '#   REDACTED = a secret existed here in the source.'
+        Add-Raw $hdr ('#' * 72)
+
+        $outpath = Join-Path $OutDir ($base + '.combined.txt')
+        $text = (Get-OutText $hdr) + (Get-OutText $body)
+        [IO.File]::WriteAllText($outpath, $text, $Utf8NoBom)
+        $sz = (Get-Item -LiteralPath $outpath).Length
+        $nlines = @(Get-Content -LiteralPath $outpath).Count
+        Write-Host ("{0} -> {1}  ({2} KB, {3} lines)" -f [IO.Path]::GetFileName($Bundle), $outpath, [int]($sz / 1024), $nlines)
+        return $outpath
+    }
+    finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Write-FleetSummary {
+    param([string]$CombDir, [string]$OutDir)
+    $devs = [ordered]@{}
+    Get-ChildItem -LiteralPath $CombDir -File | Where-Object { $_.Name.EndsWith('.combined.txt') } | Sort-Object Name | ForEach-Object {
+        $dev = $_.Name.Substring(0, $_.Name.Length - '.combined.txt'.Length)
+        $kv = @{}
+        $sec = $null
+        foreach ($line in (Get-Content -LiteralPath $_.FullName)) {
+            if ($line.StartsWith('== SECTION: ')) {
+                $sec = ($line.Substring(12) -split ' ==')[0].Trim()
+            }
+            elseif ($line.Contains(' = ') -and -not $line.StartsWith('#') -and $sec) {
+                $idx = $line.IndexOf(' = ')
+                $k = $line.Substring(0, $idx).Trim()
+                $v = $line.Substring($idx + 3).Trim()
+                $kv["$sec`0$k"] = $v
+            }
+        }
+        $devs[$dev] = $kv
+    }
+    $keys = @(
+        @('SYSTEM', 'permitted-ip'),
+        @('SYSTEM', 'service'),
+        @('MANAGEMENT SETTINGS', 'idle-timeout'),
+        @('MANAGEMENT SETTINGS', 'admin-lockout'),
+        @('SNMP', 'access-setting')
+    )
+    $out = New-OutBuffer
+    Add-Raw $out ("# FLEET SUMMARY: key management-plane settings across {0} devices" -f $devs.Count)
+    Add-Raw $out '# A cell that differs from the majority is an outlier and a candidate finding.'
+    $cols = @('SETTING') + @($devs.Keys)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $keys) {
+        $row = New-Object System.Collections.Generic.List[string]
+        $row.Add(('{0} / {1}' -f $k[0], $k[1]))
+        $key = $k[0] + "`0" + $k[1]
+        foreach ($d in $devs.Keys) {
+            $val = '(absent)'
+            if ($devs[$d].ContainsKey($key)) {
+                $val = $devs[$d][$key]
+                if ($val.Length -gt 60) { $val = $val.Substring(0, 60) }
+            }
+            $row.Add($val)
+        }
+        $rows.Add($row)
+    }
+    Add-Table $out $cols $rows
+    $p = Join-Path $OutDir 'FLEET_SUMMARY.txt'
+    [IO.File]::WriteAllText($p, (Get-OutText $out), $Utf8NoBom)
+    Write-Host "fleet summary -> $p"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+[System.IO.Directory]::SetCurrentDirectory((Get-Location).Path)
+
+if ($PSCmdlet.ParameterSetName -eq 'Fleet' -or $Fleet) {
+    if (-not $Fleet) { Write-Error 'need -Fleet folder'; exit 1 }
+    $OutputPath = Resolve-AbsolutePath $OutputPath
+    $Fleet = Resolve-AbsolutePath $Fleet
+    New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
+    Write-FleetSummary -CombDir $Fleet -OutDir $OutputPath
+    exit 0
+}
+
+if (-not $InputPath) { Write-Error 'need -InputPath or -Fleet'; exit 1 }
+
+$InputPath = Resolve-AbsolutePath $InputPath
+$OutputPath = Resolve-AbsolutePath $OutputPath
+New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
+
+$inputs = @()
+if (Test-Path -LiteralPath $InputPath -PathType Container) {
+    $inputs = @(Get-ChildItem -LiteralPath $InputPath -File |
+        Where-Object { $_.Name.ToLower().EndsWith('.tgz') -or $_.Name.ToLower().EndsWith('.tar.gz') } |
+        Sort-Object Name)
+}
+elseif (Test-Path -LiteralPath $InputPath -PathType Leaf) {
+    $inputs = @(Get-Item -LiteralPath $InputPath)
+}
+else {
+    Write-Error "Input not found: $InputPath"
+    exit 1
+}
+if (-not $inputs) { Write-Error "No .tgz/.tar.gz inputs found at $InputPath"; exit 1 }
+
+foreach ($b in $inputs) {
+    [void](Build-CombinedFile -Bundle $b.FullName -OutDir $OutputPath -DoFull:([bool]$Full))
+}
+exit 0
