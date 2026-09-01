@@ -1,0 +1,495 @@
+<#
+.SYNOPSIS
+  Slim a PAN-OS security/NAT rulebase for AI upload without dropping any rule.
+
+.DESCRIPTION
+  Ports slim_rulebase.py. Reduces a large PAN-OS security (and NAT) rulebase
+  XML to a compact form that fits AI upload limits WITHOUT dropping any rule.
+
+  PAN-OS evaluates policy first-match in order. Removing "irrelevant" rules
+  would break shadowing analysis. This script keeps EVERY rule in original
+  evaluation order and strips fields that do not participate in matching
+  (description, tag, uuid, log/profile settings, group-tag, etc.).
+
+  Optional -MgmtIps ANNOTATES rules whose destination is 'any' or names a
+  supplied management object (MGMT=Y). Annotation never filters.
+
+  Layer order (and report counts): PRE, LOCAL, POST, then PRE-NAT, LOCAL-NAT,
+  POST-NAT. Counts are taken from the SOURCE, not the output.
+
+  Output (default table format):
+    <base>.slim.txt              one file if under -MaxKb
+    <base>.slim.partNN.txt       ordered chunks if over the cap
+    <base>.slim-report.txt       source/output sizes, per-layer counts, file list
+
+.PARAMETER InputPath
+  Source PAN-OS XML file (device config, device-group, or rulebase fragment).
+
+.PARAMETER OutputPath
+  Output folder. Created if absent.
+
+.PARAMETER MgmtIps
+  Optional comma-separated management IPs/object names. Annotation only.
+
+.PARAMETER Format
+  table (default) or xml.
+
+.PARAMETER MaxKb
+  Chunk so each output file stays under this size. Default 400.
+
+.EXAMPLE
+  .\Split-PanRulebase.ps1 -InputPath .\sp-config.xml -OutputPath .\slim
+
+.EXAMPLE
+  .\Split-PanRulebase.ps1 -InputPath .\sp-config.xml -OutputPath .\slim -MgmtIps '10.1.1.10,MGT-OBJ'
+
+.EXAMPLE
+  Get-Help .\Split-PanRulebase.ps1 -Full
+
+.NOTES
+  Windows PowerShell 5.1 and PowerShell 7+. Standard .NET/PowerShell only.
+  Keep this file ASCII (or UTF-8 with BOM). Logic-equivalent to slim_rulebase.py.
+  Exit codes: 0 success, 1 usage/input/parse error.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$InputPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath,
+
+    [string]$MgmtIps = '',
+
+    [ValidateSet('table', 'xml')]
+    [string]$Format = 'table',
+
+    [ValidateRange(1, 102400)]
+    [int]$MaxKb = 400
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ===========================================================================
+# CONFIGURATION (keep aligned with slim_rulebase.py)
+# ===========================================================================
+
+$MatchFields = @(
+    'from', 'to', 'source', 'destination', 'source-user', 'service',
+    'application', 'action', 'disabled', 'negate-source',
+    'negate-destination', 'rule-type', 'category', 'source-hip',
+    'destination-hip', 'schedule', 'target'
+)
+
+# First-match XPath per layer (SelectSingleNode), same as ElementTree find().
+$RulebasePaths = [ordered]@{
+    'PRE'       = './/pre-rulebase/security/rules'
+    'LOCAL'     = './/rulebase/security/rules'
+    'POST'      = './/post-rulebase/security/rules'
+    'PRE-NAT'   = './/pre-rulebase/nat/rules'
+    'LOCAL-NAT' = './/rulebase/nat/rules'
+    'POST-NAT'  = './/post-rulebase/nat/rules'
+}
+
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+# ===========================================================================
+# HELPERS
+# ===========================================================================
+
+function Get-LocalName([System.Xml.XmlNode]$Node) {
+    if ($Node.LocalName) { return $Node.LocalName }
+    return $Node.Name
+}
+
+function Get-MemberValues {
+    param(
+        [System.Xml.XmlElement]$Entry,
+        [string]$Tag
+    )
+    $node = $null
+    foreach ($child in $Entry.ChildNodes) {
+        if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element -and (Get-LocalName $child) -eq $Tag) {
+            $node = $child
+            break
+        }
+    }
+    if ($null -eq $node) {
+        return [string[]]@()
+    }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($m in $node.ChildNodes) {
+        if ($m.NodeType -eq [System.Xml.XmlNodeType]::Element -and (Get-LocalName $m) -eq 'member') {
+            if ($null -ne $m.InnerText -and $m.InnerText.Trim().Length -gt 0) {
+                [void]$out.Add($m.InnerText.Trim())
+            }
+        }
+    }
+    if ($out.Count -eq 0) {
+        # Direct text under the element (no <member> children), matching Python.
+        $direct = ''
+        foreach ($c in $node.ChildNodes) {
+            if ($c.NodeType -eq [System.Xml.XmlNodeType]::Text -or $c.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
+                $direct += $c.Value
+            }
+        }
+        if ($direct.Trim().Length -gt 0) {
+            [void]$out.Add($direct.Trim())
+        }
+    }
+    # Cast to [string[]] so callers never see a nested Object[] wrapper
+    # (PowerShell `return , $array` nesting broke -join and -contains).
+    return [string[]]$out.ToArray()
+}
+
+function New-SlimEntry {
+    param(
+        [System.Xml.XmlDocument]$Doc,
+        [System.Xml.XmlElement]$Entry,
+        [string]$Layer,
+        [int]$Order,
+        [bool]$MgmtRelevant
+    )
+    $name = $Entry.GetAttribute('name')
+    $new = $Doc.CreateElement('entry')
+    $new.SetAttribute('name', $name)
+    $new.SetAttribute('order', [string]$Order)
+    $new.SetAttribute('layer', $Layer)
+    if ($MgmtRelevant) {
+        $new.SetAttribute('mgmt-relevant', 'yes')
+    }
+    foreach ($child in $Entry.ChildNodes) {
+        if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+        $tag = Get-LocalName $child
+        if ($MatchFields -contains $tag) {
+            # ImportNode: cloned nodes belong to the source doc; outDoc needs its own copy.
+            [void]$new.AppendChild($Doc.ImportNode($child, $true))
+        }
+    }
+    return $new
+}
+
+function Get-FieldJoined {
+    param(
+        [System.Xml.XmlElement]$Entry,
+        [string]$Tag
+    )
+    $vals = [string[]](Get-MemberValues -Entry $Entry -Tag $Tag)
+    if ($null -eq $vals -or $vals.Count -eq 0) { return '-' }
+    return [string]::Join(';', $vals)
+}
+
+function Get-ChildText {
+    param(
+        [System.Xml.XmlElement]$Entry,
+        [string]$Tag
+    )
+    foreach ($child in $Entry.ChildNodes) {
+        if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element -and (Get-LocalName $child) -eq $Tag) {
+            if ($null -ne $child.InnerText -and $child.InnerText.Trim().Length -gt 0) {
+                return $child.InnerText.Trim()
+            }
+            return '-'
+        }
+    }
+    return '-'
+}
+
+function Write-Utf8File {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+    [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
+}
+
+function Format-XmlElement {
+    param(
+        [System.Xml.XmlElement]$Element,
+        [switch]$Compact
+    )
+    # Compact (no indent) matches Python ET.tostring size estimates used for chunking.
+    # Pretty-printed form is for the bytes we write to disk.
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = -not $Compact.IsPresent
+    $settings.IndentChars = '  '
+    $settings.OmitXmlDeclaration = $true
+    $settings.NewLineChars = "`n"
+    $settings.NewLineHandling = [System.Xml.NewLineHandling]::Replace
+    $settings.Encoding = $Utf8NoBom
+    $sb = New-Object System.Text.StringBuilder
+    $writer = [System.Xml.XmlWriter]::Create($sb, $settings)
+    try {
+        $Element.WriteTo($writer)
+    } finally {
+        $writer.Close()
+    }
+    return $sb.ToString()
+}
+
+function Get-SizeKbFloor([long]$Bytes) {
+    # Match Python // 1024 (floor), not MidpointRounding banker's round via [int].
+    return [int][Math]::Floor($Bytes / 1024.0)
+}
+
+function Format-InvariantPercent([double]$Value) {
+    return $Value.ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture) + '%'
+}
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) {
+    Write-Host "Input file not found: $InputPath" -ForegroundColor Red
+    exit 1
+}
+
+New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
+$InputPath = (Resolve-Path -LiteralPath $InputPath).Path
+$OutputPath = (Resolve-Path -LiteralPath $OutputPath).Path
+[System.IO.Directory]::SetCurrentDirectory((Get-Location).Path)
+
+$srcSize = (Get-Item -LiteralPath $InputPath).Length
+$mgmt = @()
+if ($MgmtIps -and $MgmtIps.Trim().Length -gt 0) {
+    $mgmt = @(
+        $MgmtIps.Split(',') |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_.Length -gt 0 }
+    )
+}
+
+try {
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.PreserveWhitespace = $false
+    $doc.Load($InputPath)
+} catch {
+    Write-Host "Failed to parse XML: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+$root = $doc.DocumentElement
+$outDoc = New-Object System.Xml.XmlDocument
+$outRoot = $outDoc.CreateElement('slim-rulebase')
+[void]$outDoc.AppendChild($outRoot)
+
+$counts = [ordered]@{}
+$flagged = 0
+$total = 0
+# Snapshot of slimmed entries per layer for table/xml emission.
+$layerEntries = [ordered]@{}
+
+foreach ($label in $RulebasePaths.Keys) {
+    $xpath = $RulebasePaths[$label]
+    $container = $root.SelectSingleNode($xpath)
+    if ($null -eq $container) {
+        $counts[$label] = 0
+        $layerEntries[$label] = @()
+        continue
+    }
+
+    $entries = @($container.SelectNodes('./entry'))
+    $counts[$label] = $entries.Count
+    if ($entries.Count -eq 0) {
+        $layerEntries[$label] = @()
+        continue
+    }
+
+    $sec = $outDoc.CreateElement('rulebase')
+    $sec.SetAttribute('layer', $label)
+    $sec.SetAttribute('count', [string]$entries.Count)
+    [void]$outRoot.AppendChild($sec)
+
+    $slimList = New-Object System.Collections.Generic.List[System.Xml.XmlElement]
+    for ($idx = 0; $idx -lt $entries.Count; $idx++) {
+        $entry = $entries[$idx]
+        $mgmtRelevant = $false
+        if ($mgmt.Count -gt 0) {
+            $dests = [string[]](Get-MemberValues -Entry $entry -Tag 'destination')
+            $isAny = $false
+            foreach ($d in $dests) {
+                if ($d.ToLowerInvariant() -eq 'any') { $isAny = $true; break }
+            }
+            if ($isAny) {
+                $mgmtRelevant = $true
+            } else {
+                foreach ($m in $mgmt) {
+                    if ($dests -contains $m) {
+                        $mgmtRelevant = $true
+                        break
+                    }
+                }
+            }
+            if ($mgmtRelevant) { $flagged++ }
+        }
+
+        $slim = New-SlimEntry -Doc $outDoc -Entry $entry -Layer $label -Order $idx -MgmtRelevant $mgmtRelevant
+        [void]$sec.AppendChild($slim)
+        [void]$slimList.Add($slim)
+        $total++
+    }
+    $layerEntries[$label] = $slimList.ToArray()
+}
+
+# --- Build body -----------------------------------------------------------
+$body = $null
+if ($Format -eq 'table') {
+    $tl = New-Object System.Collections.Generic.List[string]
+    [void]$tl.Add('# PAN-OS security/NAT rules, slimmed. One rule per line.')
+    [void]$tl.Add('# Evaluation order is PRE, then LOCAL, then POST; first match wins.')
+    [void]$tl.Add('# Fields: LAYER|ORDER|NAME|FROM|TO|SOURCE|DEST|APP|SERVICE|ACTION|DISABLED|MGMT')
+    [void]$tl.Add("# Multiple members are semicolon-separated. '-' means the field is absent.")
+    [void]$tl.Add("# MGMT=Y marks a rule whose destination is 'any' or names a supplied management object. Annotation only.")
+    [void]$tl.Add('#')
+
+    foreach ($label in $layerEntries.Keys) {
+        foreach ($e in @($layerEntries[$label])) {
+            $mgmtCol = if ($e.GetAttribute('mgmt-relevant') -eq 'yes') { 'Y' } else { '-' }
+            $name = $e.GetAttribute('name')
+            if (-not $name) { $name = '-' }
+            $line = @(
+                $label,
+                $e.GetAttribute('order'),
+                $name,
+                (Get-FieldJoined -Entry $e -Tag 'from'),
+                (Get-FieldJoined -Entry $e -Tag 'to'),
+                (Get-FieldJoined -Entry $e -Tag 'source'),
+                (Get-FieldJoined -Entry $e -Tag 'destination'),
+                (Get-FieldJoined -Entry $e -Tag 'application'),
+                (Get-FieldJoined -Entry $e -Tag 'service'),
+                (Get-ChildText -Entry $e -Tag 'action'),
+                (Get-ChildText -Entry $e -Tag 'disabled'),
+                $mgmtCol
+            ) -join '|'
+            [void]$tl.Add($line)
+        }
+    }
+    $body = ($tl -join "`n")
+} else {
+    $body = Format-XmlElement -Element $outRoot
+}
+
+$base = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
+# Strip inner .tar left by names like foo.tar.gz if ever used as stem.
+$base = $base -replace '\.tar$', ''
+$maxBytes = $MaxKb * 1024
+$written = New-Object System.Collections.Generic.List[string]
+$bodyBytes = $Utf8NoBom.GetByteCount($body)
+
+if ($bodyBytes -le $maxBytes) {
+    $p = Join-Path $OutputPath ($base + '.slim.txt')
+    $text = if ($Format -eq 'xml') {
+        "<?xml version=`"1.0`" encoding=`"utf-8`"?>`n" + $body + "`n"
+    } else {
+        $body + "`n"
+    }
+    Write-Utf8File -Path $p -Text $text
+    [void]$written.Add($p)
+} elseif ($Format -eq 'table') {
+    $linesAll = $body -split "`n"
+    $header = @($linesAll | Where-Object { $_.StartsWith('#') })
+    $rows = @($linesAll | Where-Object { -not $_.StartsWith('#') })
+    $part = 1
+    $i = 0
+    while ($i -lt $rows.Count) {
+        $buf = New-Object System.Collections.Generic.List[string]
+        foreach ($h in $header) { [void]$buf.Add($h) }
+        $size = 0
+        foreach ($h in $header) { $size += $h.Length + 1 }
+        $start = $i
+        while ($i -lt $rows.Count) {
+            $ln = $rows[$i]
+            if (($size + $ln.Length + 1) -gt $maxBytes -and $i -gt $start) { break }
+            [void]$buf.Add($ln)
+            $size += $ln.Length + 1
+            $i++
+        }
+        $partLine = "# THIS PART: rows $start-$($i - 1) of $($rows.Count) total"
+        $buf.Insert($header.Count, $partLine)
+        $p = Join-Path $OutputPath ("{0}.slim.part{1:D2}.txt" -f $base, $part)
+        Write-Utf8File -Path $p -Text (($buf -join "`n") + "`n")
+        [void]$written.Add($p)
+        $part++
+    }
+} else {
+    # Chunk by rulebase layer, then by rule size, preserving order.
+    $part = 1
+    foreach ($sec in @($outRoot.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })) {
+        $layer = $sec.GetAttribute('layer')
+        $kids = @($sec.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })
+        $i = 0
+        while ($i -lt $kids.Count) {
+            $chunkDoc = New-Object System.Xml.XmlDocument
+            $chunk = $chunkDoc.CreateElement('slim-rulebase')
+            [void]$chunkDoc.AppendChild($chunk)
+            $csec = $chunkDoc.CreateElement('rulebase')
+            $csec.SetAttribute('layer', $layer)
+            $csec.SetAttribute('count', $sec.GetAttribute('count'))
+            [void]$chunk.AppendChild($csec)
+            $size = 0
+            $start = $i
+            while ($i -lt $kids.Count) {
+                # Size against compact XML (Python ET.tostring), not pretty-printed form.
+                $piece = Format-XmlElement -Element $kids[$i] -Compact
+                $pieceBytes = $Utf8NoBom.GetByteCount($piece)
+                if (($size + $pieceBytes) -gt $maxBytes -and $i -gt $start) { break }
+                [void]$csec.AppendChild($chunkDoc.ImportNode($kids[$i], $true))
+                $size += $pieceBytes
+                $i++
+            }
+            $csec.SetAttribute('chunk-range', ("{0}-{1}" -f $start, ($i - 1)))
+            $xmlBody = Format-XmlElement -Element $chunk
+            $p = Join-Path $OutputPath ("{0}.slim.part{1:D2}.txt" -f $base, $part)
+            Write-Utf8File -Path $p -Text ("<?xml version=`"1.0`" encoding=`"utf-8`"?>`n" + $xmlBody + "`n")
+            [void]$written.Add($p)
+            $part++
+        }
+    }
+}
+
+# --- Report ---------------------------------------------------------------
+$outSize = 0
+foreach ($wp in $written) { $outSize += (Get-Item -LiteralPath $wp).Length }
+
+$lines = New-Object System.Collections.Generic.List[string]
+[void]$lines.Add('Rulebase slimming report')
+[void]$lines.Add(('Source file : {0}' -f (Split-Path -Leaf $InputPath)))
+[void]$lines.Add(('Source size : {0} KB' -f (Get-SizeKbFloor $srcSize)))
+[void]$lines.Add(('Output size : {0} KB across {1} file(s)' -f (Get-SizeKbFloor $outSize), $written.Count))
+if ($srcSize -gt 0) {
+    $pct = 100.0 * ($srcSize - $outSize) / $srcSize
+    [void]$lines.Add(('Reduction   : {0}' -f (Format-InvariantPercent $pct)))
+}
+[void]$lines.Add('')
+[void]$lines.Add('--- RULE COUNTS (AI extraction must reconcile to these) ---')
+foreach ($label in $RulebasePaths.Keys) {
+    [void]$lines.Add(('{0,-12} {1}' -f $label, $counts[$label]))
+}
+[void]$lines.Add(('{0,-12} {1}' -f 'TOTAL', $total))
+if ($mgmt.Count -gt 0) {
+    [void]$lines.Add('')
+    [void]$lines.Add(('Management IPs/objects supplied: {0}' -f ($mgmt -join ', ')))
+    [void]$lines.Add(('Rules marked mgmt-relevant: {0} (annotation only; no rule was dropped)' -f $flagged))
+}
+[void]$lines.Add('')
+[void]$lines.Add('--- OUTPUT FILES (upload in this order) ---')
+foreach ($wp in $written) {
+    $sz = Get-SizeKbFloor ((Get-Item -LiteralPath $wp).Length)
+    [void]$lines.Add(('{0,-45} {1,6} KB' -f (Split-Path -Leaf $wp), $sz))
+}
+[void]$lines.Add('')
+[void]$lines.Add('NOTE: every rule is present, in original evaluation order.')
+[void]$lines.Add('Only non-matching fields (description, tag, uuid, log and')
+[void]$lines.Add('profile settings, group-tag) were removed. Each rule keeps')
+[void]$lines.Add('an order= and layer= attribute so first-match analysis')
+[void]$lines.Add('remains valid across chunks.')
+
+$rp = Join-Path $OutputPath ($base + '.slim-report.txt')
+Write-Utf8File -Path $rp -Text (($lines -join "`n") + "`n")
+
+Write-Host ($lines -join "`n")
+exit 0
