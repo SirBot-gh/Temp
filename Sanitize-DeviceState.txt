@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Sanitize PAN-OS device state bundles: redact secrets in every XML file and
-  write .txt copies with paths preserved.
+  write upload-safe .txt copies with paths preserved.
 
 .DESCRIPTION
   Accepts a device state archive (.tar / .tgz / .tar.gz) or an extracted folder,
@@ -11,10 +11,10 @@
 
   Per-bundle output under OutputRoot\<bundle-name>\:
     *.txt           sanitized XML text (relative paths preserved; .xml -> .txt)
-    MANIFEST.txt    human-readable summary
-    MANIFEST.json   machine-readable summary
+    MANIFEST.txt    human-readable summary (upload-safe)
+    MANIFEST.json   machine-readable summary (upload-safe)
 
-  Do not share the raw bundle or unredacted extraction -- only the sanitized .txt
+  Never upload the raw bundle or unredacted extraction -- only the sanitized .txt
   files and manifests.
 
   Exit codes:
@@ -65,7 +65,8 @@
   Windows PowerShell 5.1 and PowerShell 7+ on Windows 10/11.
   Keep this file ASCII (or UTF-8 with BOM). Windows PowerShell 5.1 reads
   BOM-less UTF-8 as the system ANSI code page; em-dashes then break parsing.
-  $RedactElements is shared with Split-PanBundle.ps1 -- keep both lists identical.
+  $RedactElements is shared with Split-PanBundle.ps1, Build-CombinedConfig.ps1,
+  and the Python twins -- keep those lists identical.
   Requires tar.exe (ships with Windows 10 1803+ / Windows 11).
 #>
 
@@ -86,16 +87,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ===========================================================================
-# CONSTANTS (keep $RedactElements in sync with Split-PanBundle.ps1)
+# CONSTANTS (keep $RedactElements in sync with Split-PanBundle.ps1
+# and Build-CombinedConfig.ps1). Literal: REDACTED (uppercase, no brackets).
 # ===========================================================================
 
 $ScriptVersion = '1.0.0'
 
+# Shared redaction list (union). Keep identical in Split-PanBundle.ps1,
+# Sanitize-DeviceState.ps1, split_pan_bundle.py, build_combined_config.py,
+# and Build-CombinedConfig.ps1.
 $RedactElements = @(
-    'phash', 'password', 'private-key', 'public-key', 'preshared-key',
-    'bind-password', 'secret', 'api-key', 'auth-password', 'priv-password',
-    'community', 'shared-secret', 'client-key', 'master-key',
-    'snmp-community-string', 'authpwd', 'privpwd'
+    'phash', 'password', 'passwd', 'pwd', 'bind-password', 'secret',
+    'shared-secret', 'admin-password', 'auth-password', 'priv-password',
+    'authpwd', 'privpwd', 'community', 'snmp-community-string',
+    'private-key', 'public-key', 'client-key', 'master-key',
+    'certificate-key', 'passphrase', 'preshared-key', 'pre-shared-key',
+    'esp-auth-key', 'ah-auth-key', 'key', 'api-key', 'token',
+    'credential', 'cookie', 'seed'
 )
 
 $IdentityElements = @(
@@ -127,7 +135,20 @@ function Normalize-PathForIo([string]$Path) {
 }
 
 function Get-Sha256([string]$Path) {
-    (Get-FileHash -LiteralPath (Normalize-PathForIo $Path) -Algorithm SHA256).Hash
+    # Use .NET directly -- Get-FileHash may be unavailable in some -NoProfile
+    # Windows PowerShell 5.1 sessions (module autoload can fail under SYSTEM/cmd).
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead((Normalize-PathForIo $Path))
+        try {
+            $hash = $sha.ComputeHash($stream)
+        } finally {
+            $stream.Dispose()
+        }
+        return ([BitConverter]::ToString($hash) -replace '-', '')
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 function Resolve-InputBundles {
@@ -186,6 +207,15 @@ function Get-TarCommand {
     throw 'tar is not available. On Windows, tar.exe ships with Windows 10 1803+ / Server 2019+.'
 }
 
+# Under Set-StrictMode, $LASTEXITCODE does not exist until a native command runs.
+# Prefer $? when LASTEXITCODE is missing (common after stream redirection on Windows).
+function Test-NativeFailed {
+    if (Test-Path -LiteralPath Variable:LASTEXITCODE) {
+        return $LASTEXITCODE -ne 0
+    }
+    return -not $?
+}
+
 function Expand-NestedArchives {
     param([string]$Root, [string]$TarCmd)
 
@@ -199,9 +229,9 @@ function Expand-NestedArchives {
             if (Test-Path -LiteralPath $nestedDir) { return }
             New-Item -ItemType Directory -Force -Path $nestedDir | Out-Null
             & $TarCmd -xzf $_.FullName -C $nestedDir 2>$null
-            if ($LASTEXITCODE -ne 0) {
+            if (Test-NativeFailed) {
                 & $TarCmd -xf $_.FullName -C $nestedDir 2>$null
-                if ($LASTEXITCODE -ne 0) {
+                if (Test-NativeFailed) {
                     Write-Warning "Nested file is not a tar ($($_.Name)); left packed"
                 }
             }
@@ -209,9 +239,12 @@ function Expand-NestedArchives {
 }
 
 function Get-TempRoot {
-    if ($env:TEMP) { return $env:TEMP }
-    if ($env:TMPDIR) { return $env:TMPDIR }
-    return [IO.Path]::GetTempPath()
+    $t = $null
+    if ($env:TEMP) { $t = $env:TEMP }
+    elseif ($env:TMPDIR) { $t = $env:TMPDIR }
+    else { $t = [IO.Path]::GetTempPath() }
+    # Resolve to the canonical long path so later FullName comparisons match.
+    return (Resolve-Path -LiteralPath $t).Path
 }
 
 function Expand-Bundle {
@@ -222,10 +255,11 @@ function Expand-Bundle {
 
     $temp = Join-Path (Get-TempRoot) ("sds_" + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $temp = [IO.Path]::GetFullPath($temp)
     & $TarCmd -xzf $ArchivePath -C $temp 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    if (Test-NativeFailed) {
         & $TarCmd -xf $ArchivePath -C $temp
-        if ($LASTEXITCODE -ne 0) {
+        if (Test-NativeFailed) {
             Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
             throw "tar failed on $ArchivePath"
         }
@@ -482,13 +516,37 @@ function Write-Manifest {
     [IO.File]::WriteAllText((Normalize-PathForIo $jsonPath), $json, $Utf8NoBom)
 }
 
+function Get-RelativePathFromRoot {
+    param(
+        [Parameter(Mandatory)][string]$FullPath,
+        [Parameter(Mandatory)][string]$RootPath
+    )
+    # Normalize via .NET GetFullPath so short/long TEMP aliases cannot skew length.
+    $rootFull = [IO.Path]::GetFullPath($RootPath).TrimEnd([char]'\', [char]'/')
+    $fileFull = [IO.Path]::GetFullPath($FullPath)
+    $cmp = [StringComparison]::OrdinalIgnoreCase
+    $sep = [IO.Path]::DirectorySeparatorChar
+    if (-not ($fileFull.Equals($rootFull, $cmp) -or $fileFull.StartsWith($rootFull + $sep, $cmp))) {
+        throw "Path '$fileFull' is not under extract root '$rootFull'"
+    }
+    if ($fileFull.Equals($rootFull, $cmp)) { return '' }
+    $rel = $fileFull.Substring($rootFull.Length).TrimStart([char]'\', [char]'/')
+    return ($rel -replace '\\', '/')
+}
+
 function Get-XmlFiles {
     param([string]$Root)
 
     Get-ChildItem -LiteralPath $Root -Recurse -File -Force |
         Where-Object {
             $name = $_.Name
-            $name -match '(?i)\.xml$' -or $name -match '^\..*\.xml$'
+            # Skip macOS AppleDouble sidecars (._foo.xml) that match *.xml
+            # but are not well-formed XML. Real hidden PAN files like
+            # .merged-running-config.xml still match the second pattern.
+            # Use -notlike (not `return`) so pipeline filters do not exit the function.
+            ($name -notlike '._*') -and (
+                $name -match '(?i)\.xml$' -or $name -match '^\..*\.xml$'
+            )
         }
 }
 
@@ -546,7 +604,7 @@ function Process-Bundle {
         $xmlFullNames = @($xmlFiles | ForEach-Object { $_.FullName })
         foreach ($f in $allFiles) {
             if ($xmlFullNames -contains $f.FullName) { continue }
-            $rel = $f.FullName.Substring($extractRoot.Length).TrimStart('\', '/')
+            $rel = Get-RelativePathFromRoot -FullPath $f.FullName -RootPath $extractRoot
             $filesSkipped++
             $manifestRows.Add([pscustomobject]@{
                 source = $rel
@@ -564,7 +622,7 @@ function Process-Bundle {
 
         if ($WhatIfMode) {
             foreach ($f in $xmlFiles) {
-                $rel = $f.FullName.Substring($extractRoot.Length).TrimStart('\', '/')
+                $rel = Get-RelativePathFromRoot -FullPath $f.FullName -RootPath $extractRoot
                 $outRel = [IO.Path]::ChangeExtension($rel, $OutputExtension)
                 Write-Verbose "Would write $outRel"
             }
@@ -577,7 +635,7 @@ function Process-Bundle {
         New-Item -ItemType Directory -Force -Path $bundleOut | Out-Null
 
         foreach ($f in $xmlFiles) {
-            $rel = $f.FullName.Substring($extractRoot.Length).TrimStart('\', '/')
+            $rel = Get-RelativePathFromRoot -FullPath $f.FullName -RootPath $extractRoot
             $outRel = [IO.Path]::ChangeExtension($rel, $OutputExtension)
             $outPath = Join-Path $bundleOut $outRel
             $bytesIn = $f.Length
@@ -730,7 +788,7 @@ foreach ($bundle in $bundles) {
 
 if (-not $whatIfMode) {
     Write-Host ''
-    Write-Host 'Sanitized .txt files are redacted; raw bundles and unredacted archives are not.' -ForegroundColor Yellow
+    Write-Host 'Sanitized .txt files are upload-safe; raw bundles and unredacted archives are NOT.' -ForegroundColor Yellow
     Write-Host "Output: $outRootResolved"
 }
 
