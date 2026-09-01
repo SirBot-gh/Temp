@@ -80,7 +80,8 @@
   Windows PowerShell 5.1 and PowerShell 7+ on Windows 10/11.
   No modules required. Requires tar.exe (Windows 10 1803+ / Windows 11).
   Read-only with respect to inputs: source bundles are never modified.
-  Keep $RedactElements identical to Sanitize-DeviceState.ps1.
+  Keep $RedactElements identical to Sanitize-DeviceState.ps1 and
+  Build-CombinedConfig.ps1 (and the Python twins).
 #>
 
 [CmdletBinding()]
@@ -387,11 +388,17 @@ $CountMap = [ordered]@{
 # secret, SNMP v2c community (snmp-community-string) and v3 passwords
 # (authpwd/privpwd), TLS/SSH key material, API keys.
 # ---------------------------------------------------------------------------
+# Shared redaction list (union). Keep identical in Split-PanBundle.ps1,
+# Sanitize-DeviceState.ps1, split_pan_bundle.py, build_combined_config.py,
+# and Build-CombinedConfig.ps1. Literal: REDACTED (uppercase, no brackets).
 $RedactElements = @(
-    'phash', 'password', 'private-key', 'public-key', 'preshared-key',
-    'bind-password', 'secret', 'api-key', 'auth-password', 'priv-password',
-    'community', 'shared-secret', 'client-key', 'master-key',
-    'snmp-community-string', 'authpwd', 'privpwd'
+    'phash', 'password', 'passwd', 'pwd', 'bind-password', 'secret',
+    'shared-secret', 'admin-password', 'auth-password', 'priv-password',
+    'authpwd', 'privpwd', 'community', 'snmp-community-string',
+    'private-key', 'public-key', 'client-key', 'master-key',
+    'certificate-key', 'passphrase', 'preshared-key', 'pre-shared-key',
+    'esp-auth-key', 'ah-auth-key', 'key', 'api-key', 'token',
+    'credential', 'cookie', 'seed'
 )
 
 # ===========================================================================
