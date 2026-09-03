@@ -22,8 +22,17 @@
   Folder for <bundle-basename>.combined.txt. Created if missing.
 
 .PARAMETER Full
-  Also render remaining top-level containers under devices/entry,
-  vsys/entry, and shared.
+  Include every remaining container with no value truncation, and
+  write the merged <bundle>.combined.xml. All settings from LOCAL,
+  TEMPLATE, and SP sources are kept; only same-name duplicates
+  are dropped.
+
+.PARAMETER Xml
+  Also write <bundle>.combined.xml: one merged config. All named
+  settings are kept (union, including permitted-ip). Local wins
+  only on a same-key leaf conflict. Policy layers are concatenated
+  (SHARED-PRE, DG-PRE, LOCAL, DG-POST, SHARED-POST) and deduped
+  by name within each layer.
 
 .PARAMETER Fleet
   Folder of *.combined.txt: write FLEET_SUMMARY.txt instead of
@@ -31,6 +40,12 @@
 
 .EXAMPLE
   .\Build-CombinedConfig.ps1 -InputPath .\tests\fixtures\FW-TEST_device_state.tgz -OutputPath .\combined
+
+.EXAMPLE
+  .\Build-CombinedConfig.ps1 -InputPath .\tests\fixtures\FW-TEST_device_state.tgz -OutputPath .\combined -Xml
+
+.EXAMPLE
+  .\Build-CombinedConfig.ps1 -InputPath .\tests\fixtures\FW-TEST_device_state.tgz -OutputPath .\combined -Full
 
 .EXAMPLE
   Get-Help .\Build-CombinedConfig.ps1 -Full
@@ -51,6 +66,9 @@ param(
 
     [Parameter(ParameterSetName = 'Build')]
     [switch]$Full,
+
+    [Parameter(ParameterSetName = 'Build')]
+    [switch]$Xml,
 
     [Parameter(ParameterSetName = 'Fleet')]
     [string]$Fleet
@@ -85,6 +103,7 @@ $SafeTags = @(
 $DevPath = './devices/entry'
 $VsysPath = './devices/entry/vsys/entry'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+$PolicyLayerTags = @('pre-rulebase', 'rulebase', 'post-rulebase')
 
 # ---------------------------------------------------------------------------
 # Path / IO helpers
@@ -458,6 +477,11 @@ function Add-Table($Out, [string[]]$Cols, $Rows) {
 
 function Add-Raw($Out, [string]$S) { $Out.Lines.Add($S) }
 
+function Get-ClippedText([string]$Text, [int]$Max, [bool]$KeepAll) {
+    if ($KeepAll -or $null -eq $Text -or $Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max)
+}
+
 function Get-OutText($Out) {
     return (($Out.Lines -join "`n") + "`n")
 }
@@ -515,8 +539,7 @@ function Write-DeviceSections {
     Add-Section $Out 'ADMIN ROLES (custom)' 'shared/admin-role'
     $roleRows = New-Object System.Collections.Generic.List[object]
     foreach ($row in (Get-MergedEntries $L $T './shared/admin-role' $Overrides)) {
-        $sum = ConvertTo-Flatten $row.El
-        if ($sum.Length -gt 200) { $sum = $sum.Substring(0, 200) }
+        $sum = Get-ClippedText (ConvertTo-Flatten $row.El) 200 $DoFull
         $roleRows.Add(@($row.Name, $sum, $row.Src))
     }
     Add-Table $Out @('NAME', 'SUMMARY', 'SRC') $roleRows
@@ -542,8 +565,7 @@ function Write-DeviceSections {
     $spRows = New-Object System.Collections.Generic.List[object]
     foreach ($row in (Get-MergedContainer $L $T './shared/server-profile' $Overrides)) {
         foreach ($ent in $row.El.SelectNodes('entry')) {
-            $det = ConvertTo-Flatten $ent
-            if ($det.Length -gt 200) { $det = $det.Substring(0, 200) }
+            $det = Get-ClippedText (ConvertTo-Flatten $ent) 200 $DoFull
             $spRows.Add(@($ent.GetAttribute('name'), $row.Tag, $det, $row.Src))
         }
     }
@@ -552,8 +574,7 @@ function Write-DeviceSections {
     Add-Section $Out 'CERTIFICATE PROFILES' 'shared/certificate-profile'
     $cpRows = New-Object System.Collections.Generic.List[object]
     foreach ($row in (Get-MergedEntries $L $T './shared/certificate-profile' $Overrides)) {
-        $det = ConvertTo-Flatten $row.El
-        if ($det.Length -gt 200) { $det = $det.Substring(0, 200) }
+        $det = Get-ClippedText (ConvertTo-Flatten $row.El) 200 $DoFull
         $cpRows.Add(@($row.Name, $det, $row.Src))
     }
     Add-Table $Out @('NAME', 'DETAIL', 'SRC') $cpRows
@@ -634,8 +655,7 @@ function Write-DeviceSections {
     Add-Section $Out 'ZONE PROTECTION PROFILES' 'network/profiles/zone-protection-profile'
     $zpRows = New-Object System.Collections.Generic.List[object]
     foreach ($row in (Get-MergedEntries $L $T ($DevPath + '/network/profiles/zone-protection-profile') $Overrides)) {
-        $sum = ConvertTo-Flatten $row.El
-        if ($sum.Length -gt 200) { $sum = $sum.Substring(0, 200) }
+        $sum = Get-ClippedText (ConvertTo-Flatten $row.El) 200 $DoFull
         $zpRows.Add(@($row.Name, $sum, $row.Src))
     }
     Add-Table $Out @('NAME', 'SUMMARY', 'SRC') $zpRows
@@ -691,8 +711,7 @@ function Write-DeviceSections {
     Add-Section $Out 'LOG SETTINGS' 'shared/log-settings'
     foreach ($row in (Get-MergedContainer $L $T './shared/log-settings' $Overrides)) {
         if ($row.Tag -eq 'syslog') { continue }
-        $v = ConvertTo-Flatten $row.El
-        if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
+        $v = Get-ClippedText (ConvertTo-Flatten $row.El) 300 $DoFull
         Add-Kv $Out $row.Tag $v $row.Src
     }
 
@@ -717,8 +736,7 @@ function Write-DeviceSections {
     $rows = Get-MergedContainer $L $T ($VsysPath + '/global-protect') $Overrides
     if ($rows.Count -eq 0) { Add-Raw $Out '(absent: no GlobalProtect configured on-box)' }
     foreach ($row in $rows) {
-        $v = ConvertTo-Flatten $row.El
-        if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
+        $v = Get-ClippedText (ConvertTo-Flatten $row.El) 300 $DoFull
         Add-Kv $Out $row.Tag $v $row.Src
     }
 
@@ -755,7 +773,6 @@ function Write-FullRemaining {
         foreach ($row in (Get-MergedContainer $L $T $b[1] $Overrides)) {
             if ($b[2] -contains $row.Tag) { continue }
             $v = ConvertTo-Flatten $row.El
-            if ($v.Length -gt 300) { $v = $v.Substring(0, 300) }
             Add-Kv $Out $row.Tag $v $row.Src
             $shown = $true
         }
@@ -900,6 +917,376 @@ function Get-CountBlock($L, $T, $PolicyCounts) {
 }
 
 # ---------------------------------------------------------------------------
+# Effective XML merge (LOCAL wins; named objects unioned; policy concatenated)
+# ---------------------------------------------------------------------------
+
+function Get-XmlChildKey($El) {
+    $tag = $El.LocalName
+    if ($tag -eq 'entry') { return ($tag + "`0" + $El.GetAttribute('name')) }
+    if ($tag -eq 'member') { return ($tag + "`0" + (Get-XmlDirectText $El)) }
+    return ($tag + "`0")
+}
+
+function Copy-XmlNode {
+    param($Doc, $Node)
+    if ($null -eq $Node) { return $null }
+    if ($Node.OwnerDocument -eq $Doc) { return $Node.CloneNode($true) }
+    return $Doc.ImportNode($Node, $true)
+}
+
+function Merge-XmlElement {
+    param($Doc, $Winner, $Other)
+    if ($null -eq $Winner) { return (Copy-XmlNode $Doc $Other) }
+    if ($null -eq $Other) { return (Copy-XmlNode $Doc $Winner) }
+    $result = $Doc.CreateElement($Winner.LocalName)
+    if ($null -ne $Other.Attributes) {
+        foreach ($a in $Other.Attributes) {
+            if ($a.Prefix -eq 'xmlns' -or $a.LocalName -eq 'xmlns') { continue }
+            $result.SetAttribute($a.Name, $a.Value)
+        }
+    }
+    if ($null -ne $Winner.Attributes) {
+        foreach ($a in $Winner.Attributes) {
+            if ($a.Prefix -eq 'xmlns' -or $a.LocalName -eq 'xmlns') { continue }
+            $result.SetAttribute($a.Name, $a.Value)
+        }
+    }
+    $wmap = @{}
+    $worder = New-Object System.Collections.Generic.List[string]
+    foreach ($c in (Get-XmlElements $Winner)) {
+        $k = Get-XmlChildKey $c
+        if (-not $wmap.ContainsKey($k)) { $worder.Add($k) }
+        $wmap[$k] = $c
+    }
+    $omap = @{}
+    $oorder = New-Object System.Collections.Generic.List[string]
+    foreach ($c in (Get-XmlElements $Other)) {
+        $k = Get-XmlChildKey $c
+        if (-not $omap.ContainsKey($k)) { $oorder.Add($k) }
+        $omap[$k] = $c
+    }
+    $order = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $oorder) { $order.Add($k) }
+    foreach ($k in $worder) {
+        if (-not $omap.ContainsKey($k)) { $order.Add($k) }
+    }
+    foreach ($k in $order) {
+        $w = $null
+        $o = $null
+        if ($wmap.ContainsKey($k)) { $w = $wmap[$k] }
+        if ($omap.ContainsKey($k)) { $o = $omap[$k] }
+        if ($null -ne $w -and $null -ne $o) {
+            $tag = ($k.Split([char]0))[0]
+            if ($tag -eq 'member') {
+                [void]$result.AppendChild((Copy-XmlNode $Doc $w))
+            }
+            else {
+                # Recurse into same-name entries (devices/entry, vsys/entry)
+                # and nested settings bags so template-only children survive.
+                $wkids = Get-XmlElements $w
+                $okids = Get-XmlElements $o
+                if ($wkids.Count -gt 0 -or $okids.Count -gt 0) {
+                    [void]$result.AppendChild((Merge-XmlElement -Doc $Doc -Winner $w -Other $o))
+                }
+                else {
+                    [void]$result.AppendChild((Copy-XmlNode $Doc $w))
+                }
+            }
+        }
+        elseif ($null -ne $w) {
+            [void]$result.AppendChild((Copy-XmlNode $Doc $w))
+        }
+        else {
+            [void]$result.AppendChild((Copy-XmlNode $Doc $o))
+        }
+    }
+    $resultKids = Get-XmlElements $result
+    if ($resultKids.Count -eq 0) {
+        $wtxt = Get-XmlDirectText $Winner
+        $otxt = Get-XmlDirectText $Other
+        if ($wtxt) { $result.InnerText = $wtxt }
+        elseif ($otxt) { $result.InnerText = $otxt }
+    }
+    return $result
+}
+
+function Find-OrCreateXmlChild {
+    param($Parent, [string]$Tag, [string]$Name = $null)
+    $doc = $Parent.OwnerDocument
+    if ($Name) {
+        foreach ($e in (Get-XmlElements $Parent)) {
+            if ($e.LocalName -eq $Tag -and $e.GetAttribute('name') -eq $Name) { return $e }
+        }
+        $el = $doc.CreateElement($Tag)
+        $el.SetAttribute('name', $Name)
+        [void]$Parent.AppendChild($el)
+        return $el
+    }
+    foreach ($e in (Get-XmlElements $Parent)) {
+        if ($e.LocalName -eq $Tag) { return $e }
+    }
+    $el = $doc.CreateElement($Tag)
+    [void]$Parent.AppendChild($el)
+    return $el
+}
+
+function Get-OrCreateDeviceEntry {
+    param($Root)
+    $devices = Find-OrCreateXmlChild $Root 'devices'
+    foreach ($e in (Get-XmlElements $devices)) {
+        if ($e.LocalName -eq 'entry') { return $e }
+    }
+    $ent = $Root.OwnerDocument.CreateElement('entry')
+    $ent.SetAttribute('name', 'localhost.localdomain')
+    [void]$devices.AppendChild($ent)
+    return $ent
+}
+
+function Get-OrCreateVsysEntry {
+    param($Root, [string]$VsysName)
+    $dev = Get-OrCreateDeviceEntry $Root
+    $vsys = Find-OrCreateXmlChild $dev 'vsys'
+    return (Find-OrCreateXmlChild $vsys 'entry' $VsysName)
+}
+
+function Copy-XmlWithoutPolicy {
+    param($Doc, $El)
+    $out = Copy-XmlNode $Doc $El
+    foreach ($c in @($out.ChildNodes)) {
+        if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element -and $PolicyLayerTags -contains $c.LocalName) {
+            [void]$out.RemoveChild($c)
+        }
+    }
+    return $out
+}
+
+function Merge-XmlIntoContainer {
+    param($Parent, $Incoming)
+    if ($null -eq $Incoming) { return }
+    $doc = $Parent.OwnerDocument
+    foreach ($child in (Get-XmlElements $Incoming)) {
+        $tag = $child.LocalName
+        if ($tag -eq 'entry') {
+            $name = $child.GetAttribute('name')
+            $old = $null
+            foreach ($e in (Get-XmlElements $Parent)) {
+                if ($e.LocalName -eq 'entry' -and $e.GetAttribute('name') -eq $name) { $old = $e; break }
+            }
+            if ($null -eq $old) {
+                [void]$Parent.AppendChild((Copy-XmlNode $doc $child))
+            }
+            else {
+                [void]$Parent.ReplaceChild((Merge-XmlElement -Doc $doc -Winner $old -Other $child), $old)
+            }
+            continue
+        }
+        $old = $null
+        foreach ($e in (Get-XmlElements $Parent)) {
+            if ($e.LocalName -eq $tag) { $old = $e; break }
+        }
+        if ($null -eq $old) {
+            [void]$Parent.AppendChild((Copy-XmlNode $doc $child))
+        }
+        else {
+            [void]$Parent.ReplaceChild((Merge-XmlElement -Doc $doc -Winner $old -Other $child), $old)
+        }
+    }
+}
+
+function Merge-SpShared {
+    param($Merged, $Sps)
+    if ($null -eq $Sps) { return }
+    $doc = $Merged.OwnerDocument
+    $cleaned = Copy-XmlWithoutPolicy $doc $Sps
+    $sharedSrc = $null
+    $leftovers = New-Object System.Collections.Generic.List[object]
+    foreach ($c in (Get-XmlElements $cleaned)) {
+        if ($c.LocalName -eq 'shared') { $sharedSrc = $c }
+        else { $leftovers.Add($c) }
+    }
+    if ($null -eq $sharedSrc -and $leftovers.Count -gt 0) {
+        $sharedSrc = $doc.CreateElement('shared')
+        foreach ($c in $leftovers) { [void]$sharedSrc.AppendChild($c) }
+        $leftovers.Clear()
+    }
+    if ($null -ne $sharedSrc) {
+        $dst = $null
+        foreach ($e in (Get-XmlElements $Merged)) {
+            if ($e.LocalName -eq 'shared') { $dst = $e; break }
+        }
+        if ($null -eq $dst) {
+            [void]$Merged.AppendChild((Copy-XmlNode $doc $sharedSrc))
+        }
+        else {
+            [void]$Merged.ReplaceChild((Merge-XmlElement -Doc $doc -Winner $dst -Other $sharedSrc), $dst)
+        }
+    }
+    if ($leftovers.Count -gt 0) {
+        $dst = $null
+        foreach ($e in (Get-XmlElements $Merged)) {
+            if ($e.LocalName -eq 'shared') { $dst = $e; break }
+        }
+        if ($null -eq $dst) {
+            $dst = $doc.CreateElement('shared')
+            [void]$Merged.AppendChild($dst)
+        }
+        $wrap = $doc.CreateElement('tmp')
+        foreach ($c in $leftovers) { [void]$wrap.AppendChild((Copy-XmlNode $doc $c)) }
+        Merge-XmlIntoContainer $dst $wrap
+    }
+}
+
+function Merge-SpDgObjects {
+    param($Merged, [string]$VsysName, $DgRoot)
+    if ($null -eq $DgRoot) { return }
+    $doc = $Merged.OwnerDocument
+    $cleaned = Copy-XmlWithoutPolicy $doc $DgRoot
+    $embedded = $cleaned.SelectSingleNode('./devices/entry/vsys/entry')
+    if ($null -eq $embedded) { $embedded = $cleaned.SelectSingleNode('./vsys/entry') }
+    $src = $cleaned
+    if ($null -ne $embedded) { $src = $embedded }
+    $vsys = Get-OrCreateVsysEntry $Merged $VsysName
+    Merge-XmlIntoContainer $vsys $src
+}
+
+function Get-LayerEntries {
+    param($Root, [string]$Layer, [string]$Kind)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Root) { return ,$list }
+    $node = $Root.SelectSingleNode(($Layer + '/' + $Kind + '/rules'))
+    if ($null -eq $node) { $node = $Root.SelectSingleNode(('.//' + $Layer + '/' + $Kind + '/rules')) }
+    if ($null -eq $node) { return ,$list }
+    foreach ($e in $node.SelectNodes('entry')) { $list.Add($e) }
+    return ,$list
+}
+
+function Get-RuleKinds {
+    param($Roots)
+    $kinds = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($root in $Roots) {
+        if ($null -eq $root) { continue }
+        foreach ($layer in $PolicyLayerTags) {
+            foreach ($node in $root.SelectNodes('.//' + $layer)) {
+                foreach ($ch in (Get-XmlElements $node)) {
+                    if (-not $seen.ContainsKey($ch.LocalName)) {
+                        $seen[$ch.LocalName] = $true
+                        $kinds.Add($ch.LocalName)
+                    }
+                }
+            }
+        }
+    }
+    return ,$kinds
+}
+
+function Add-UniqueRuleEntries {
+    param($Vsys, [string]$Layer, [string]$Kind, $Entries)
+    if ($null -eq $Entries -or $Entries.Count -eq 0) { return }
+    $doc = $Vsys.OwnerDocument
+    $rb = Find-OrCreateXmlChild $Vsys $Layer
+    $kn = Find-OrCreateXmlChild $rb $Kind
+    $rules = Find-OrCreateXmlChild $kn 'rules'
+    $have = @{}
+    foreach ($e in $rules.SelectNodes('entry')) { $have[$e.GetAttribute('name')] = $true }
+    foreach ($e in $Entries) {
+        $name = $e.GetAttribute('name')
+        if ($have.ContainsKey($name)) { continue }
+        $have[$name] = $true
+        [void]$rules.AppendChild((Copy-XmlNode $doc $e))
+    }
+}
+
+function Build-MergedXml {
+    param($LocalRoot, $TplRoot, $Sps, $SpDgs)
+    $doc = New-Object System.Xml.XmlDocument
+    $dummy = $doc.CreateElement('config')
+    [void]$doc.AppendChild($dummy)
+    $merged = $null
+    if ($null -eq $LocalRoot -and $null -eq $TplRoot) {
+        $merged = $dummy
+    }
+    elseif ($null -eq $LocalRoot) {
+        $merged = Copy-XmlNode $doc $TplRoot
+        [void]$doc.ReplaceChild($merged, $dummy)
+    }
+    elseif ($null -eq $TplRoot) {
+        $merged = Copy-XmlNode $doc $LocalRoot
+        [void]$doc.ReplaceChild($merged, $dummy)
+    }
+    else {
+        $merged = Merge-XmlElement -Doc $doc -Winner $LocalRoot -Other $TplRoot
+        [void]$doc.ReplaceChild($merged, $dummy)
+    }
+    Merge-SpShared $merged $Sps
+    foreach ($dg in $SpDgs) {
+        Merge-SpDgObjects $merged $dg.Vsys $dg.Root
+    }
+    $kindRoots = New-Object System.Collections.Generic.List[object]
+    $kindRoots.Add($LocalRoot)
+    $kindRoots.Add($Sps)
+    foreach ($dg in $SpDgs) { $kindRoots.Add($dg.Root) }
+    $kinds = Get-RuleKinds $kindRoots
+    $vsysNames = New-Object System.Collections.Generic.List[string]
+    $seenV = @{}
+    foreach ($e in $merged.SelectNodes('./devices/entry/vsys/entry')) {
+        $n = $e.GetAttribute('name')
+        if (-not $n) { $n = 'vsys1' }
+        if (-not $seenV.ContainsKey($n)) { $seenV[$n] = $true; $vsysNames.Add($n) }
+    }
+    foreach ($dg in $SpDgs) {
+        if (-not $seenV.ContainsKey($dg.Vsys)) { $seenV[$dg.Vsys] = $true; $vsysNames.Add($dg.Vsys) }
+    }
+    if ($vsysNames.Count -eq 0) { $vsysNames.Add('vsys1') }
+    foreach ($vsysName in $vsysNames) {
+        $vsys = Get-OrCreateVsysEntry $merged $vsysName
+        $dgRoot = $null
+        foreach ($dg in $SpDgs) {
+            if ($dg.Vsys -eq $vsysName) { $dgRoot = $dg.Root; break }
+        }
+        if ($null -eq $dgRoot -and $SpDgs.Count -eq 1) { $dgRoot = $SpDgs[0].Root }
+        foreach ($kind in $kinds) {
+            $pre = New-Object System.Collections.Generic.List[object]
+            foreach ($e in (Get-LayerEntries $Sps 'pre-rulebase' $kind)) { $pre.Add($e) }
+            foreach ($e in (Get-LayerEntries $dgRoot 'pre-rulebase' $kind)) { $pre.Add($e) }
+            Add-UniqueRuleEntries $vsys 'pre-rulebase' $kind $pre
+            $post = New-Object System.Collections.Generic.List[object]
+            foreach ($e in (Get-LayerEntries $dgRoot 'post-rulebase' $kind)) { $post.Add($e) }
+            foreach ($e in (Get-LayerEntries $Sps 'post-rulebase' $kind)) { $post.Add($e) }
+            Add-UniqueRuleEntries $vsys 'post-rulebase' $kind $post
+        }
+    }
+    return $merged
+}
+
+function Write-MergedXmlFile {
+    param([string]$Path, $Root, [string[]]$HeaderLines)
+    $fresh = New-Object System.Xml.XmlDocument
+    $fresh.PreserveWhitespace = $false
+    $fresh.LoadXml($Root.OuterXml)
+    $doc = New-Object System.Xml.XmlDocument
+    $decl = $doc.CreateXmlDeclaration('1.0', 'UTF-8', $null)
+    [void]$doc.AppendChild($decl)
+    $comment = $doc.CreateComment(("`n" + ($HeaderLines -join "`n") + "`n"))
+    [void]$doc.AppendChild($comment)
+    [void]$doc.AppendChild($doc.ImportNode($fresh.DocumentElement, $true))
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Encoding = $Utf8NoBom
+    $settings.Indent = $true
+    $settings.IndentChars = '  '
+    $settings.NewLineChars = "`n"
+    $settings.NewLineHandling = [System.Xml.NewLineHandling]::Replace
+    $settings.OmitXmlDeclaration = $false
+    $writer = [System.Xml.XmlWriter]::Create($Path, $settings)
+    try {
+        $doc.Save($writer)
+    }
+    finally {
+        $writer.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Bundle load / build
 # ---------------------------------------------------------------------------
 
@@ -923,7 +1310,7 @@ function Import-BundleXml {
 }
 
 function Build-CombinedFile {
-    param([string]$Bundle, [string]$OutDir, [bool]$DoFull)
+    param([string]$Bundle, [string]$OutDir, [bool]$DoFull, [bool]$WriteXml)
     $base = Get-BundleBaseName ([IO.Path]::GetFileName($Bundle))
     $work = Join-Path $OutDir ('_work_' + $base)
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
@@ -1035,6 +1422,21 @@ function Build-CombinedFile {
         $sz = (Get-Item -LiteralPath $outpath).Length
         $nlines = @(Get-Content -LiteralPath $outpath).Count
         Write-Host ("{0} -> {1}  ({2} KB, {3} lines)" -f [IO.Path]::GetFileName($Bundle), $outpath, [int]($sz / 1024), $nlines)
+        if ($WriteXml -or $DoFull) {
+            $merged = Build-MergedXml -LocalRoot $L -TplRoot $T -Sps $SPS -SpDgs $spDgs
+            $xmlHeader = @(
+                'PAN-OS merged effective configuration'
+                ('Device: {0} | Bundle: {1} | Generated: {2}' -f $hostname, [IO.Path]::GetFileName($Bundle), (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+                ('Sources merged: LOCAL={0} TEMPLATE={1} SP-SHARED={2} SP-DG={3}' -f (& $yesNo $L), (& $yesNo $T), (& $yesNo $SPS), (& $yesNo $SPD))
+                ('Redaction: {0} secret values masked' -f $redTotal)
+                'Merge: local wins on leaf conflict; all named settings kept (union, dedup by name)'
+                'Policy: SHARED-PRE, DG-PRE, LOCAL, DG-POST, SHARED-POST (deduped per layer)'
+            )
+            $xmlpath = Join-Path $OutDir ($base + '.combined.xml')
+            Write-MergedXmlFile -Path $xmlpath -Root $merged -HeaderLines $xmlHeader
+            $xsz = (Get-Item -LiteralPath $xmlpath).Length
+            Write-Host ("{0} -> {1}  ({2} KB)" -f [IO.Path]::GetFileName($Bundle), $xmlpath, [int]($xsz / 1024))
+        }
         return $outpath
     }
     finally {
@@ -1131,6 +1533,6 @@ else {
 if (-not $inputs) { Write-Error "No .tgz/.tar.gz inputs found at $InputPath"; exit 1 }
 
 foreach ($b in $inputs) {
-    [void](Build-CombinedFile -Bundle $b.FullName -OutDir $OutputPath -DoFull:([bool]$Full))
+    [void](Build-CombinedFile -Bundle $b.FullName -OutDir $OutputPath -DoFull:([bool]$Full) -WriteXml:([bool]$Xml))
 }
 exit 0
