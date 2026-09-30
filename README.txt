@@ -4,6 +4,7 @@ PowerShell scripts posted as .txt.
   Split-PanBundle.txt
   Split-PanRulebase.txt
   Build-CombinedConfig.txt
+  Build-ComponentChunks.txt
 
 To run on Windows, rename to .ps1, then:
 
@@ -12,3 +13,4 @@ To run on Windows, rename to .ps1, then:
   powershell -NoProfile -ExecutionPolicy Bypass -File .\Split-PanRulebase.ps1 -InputPath <rulebase.xml> -OutputPath <out>
   powershell -NoProfile -ExecutionPolicy Bypass -File .\Build-CombinedConfig.ps1 -InputPath <bundle.tgz> -OutputPath <out>
   powershell -NoProfile -ExecutionPolicy Bypass -File .\Build-CombinedConfig.ps1 -InputPath <bundle.tgz> -OutputPath <out> -Xml
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\Build-ComponentChunks.ps1 -InputPath <bundle> -OutputPath <out>

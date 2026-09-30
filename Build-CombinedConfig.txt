@@ -8,7 +8,17 @@
   Correct when it reproduces tests\golden\FW-TEST_device_state.combined.txt
   byte-for-byte except the Generated: timestamp line.
 
-  Classification is by PATH, then filename, never by content alone.
+  FULL COMBINED / SINGLE-UPLOAD MODE (keep this path). For limited-AI
+  per-domain chats use Build-ComponentChunks.ps1 (01-08) instead; both
+  modes share the same device-state path model and can be run together.
+
+  Authoritative device-state sources (path-first; never content alone):
+    LOCAL     = root running-config.xml only (local firewall config;
+                NOT inclusive of Panorama pushes)
+    TEMPLATE  = template/template-config.xml only (Network + Device push)
+    SP-SHARED = sp/shared/sp-config.xml (Policies + Objects, shared)
+    SP-DG     = sp/<vsys>/sp-config.xml for each vsys (Policies + Objects)
+  Ignore pretrans / ha-transform / last-pushed variants (not merged).
   Unrecognised XML is appended in Appendix B (never dropped).
   Policy is concatenated in evaluation order, not merged.
   Multi-vsys: every sp/<name>/sp-config.xml except shared is SP-DG.
@@ -316,9 +326,11 @@ function ConvertTo-EtXml {
 # ---------------------------------------------------------------------------
 
 function Get-BundleRole([string]$Rel) {
+    # Path-first roles (coworker device-state model). LOCAL is root-only:
+    # basename matches elsewhere must not steal the local-config role.
     $r = $Rel.Replace('\', '/').ToLower()
     $base = [IO.Path]::GetFileName($r)
-    if ($base -eq 'running-config.xml') { return 'LOCAL' }
+    if ($r -eq 'running-config.xml') { return 'LOCAL' }
     if ($r.StartsWith('template/') -and $base -eq 'template-config.xml') { return 'TEMPLATE' }
     if ($r.StartsWith('template/')) { return 'TEMPLATE-VARIANT' }
     if ($r.StartsWith('sp/shared/') -and $base -eq 'sp-config.xml') { return 'SP-SHARED' }

@@ -11,18 +11,21 @@
   truncation and fabricated findings. This script does the deterministic
   work locally so the AI only ever sees small, verifiable fragments.
 
+  For limited-AI per-domain conversations (01-08 merged chunks), prefer
+  Build-ComponentChunks.ps1. This script keeps fine-grained LOCAL_/TEMPLATE_/
+  DEVGROUP_ fragments. Build-CombinedConfig.ps1 remains the full single-file
+  combined mode. All three share the same path-first device-state model.
+
   For each input bundle or XML file this script:
     1. Extracts the archive (tar.exe, built into Windows 10 1803+).
-    2. Identifies every XML file by CONTENT (root element and structural
-       markers), never by filename, because bundle-internal filenames are
-       undocumented by Palo Alto and vary across PAN-OS versions. A
-       filename-based approach would silently miss files on some versions.
-    3. Classifies each XML as: local-config, pushed-template,
-       pushed-device-group, config-unclassified, or other. The class
-       becomes the fragment prefix (LOCAL_/TEMPLATE_/DEVGROUP_) so that
+    2. Classifies XML path-first (coworker model): root running-config.xml
+       = local-config; template/template-config.xml = pushed-template;
+       sp/shared|vsys*/sp-config.xml = pushed-device-group. Ignores
+       pretrans/ha-transform/last-pushed variants for fragmentation.
+       Content-based Classify-PanXml is fallback only for flat/standalone
+       layouts (e.g. TESTFW-01) that lack the real path layout.
+    3. Class becomes the fragment prefix (LOCAL_/TEMPLATE_/DEVGROUP_) so
        "where did this setting come from" survives into the AI sessions.
-       That distinction drives override detection and tells the customer
-       whether a fix belongs in Panorama or on the box.
     4. Extracts a fixed set of control-area fragments from each config
        via XPath. A fragment the source genuinely lacks is recorded as
        NOT-PRESENT in the manifest rather than silently skipped, so
@@ -412,27 +415,21 @@ function Get-Sha256($Path) {
     (Get-FileHash -Path $Path -Algorithm SHA256).Hash
 }
 
-# Classify a parsed PAN-OS XML document by its structure.
+# Classify a parsed PAN-OS XML document by its structure (fallback only).
+#
+# Prefer Get-PathBundleRole / Resolve-FragmentRole for real device-state
+# layouts. Content classification remains for flat synthetic bundles
+# (TESTFW-01) and standalone running-config exports.
 #
 # Decision logic, in priority order:
 #   1. Contains <template> (as root or under /config) -> pushed-template.
-#      Template files wrap device settings pushed from Panorama.
-#   2. Has device-group markers (device-group element, or pre/post
-#      rulebases) WITHOUT deviceconfig -> pushed-device-group. The
-#      "-and -not hasDeviceconfig" guard matters: a merged running config
-#      can legitimately contain pre/post rulebases AND deviceconfig, and
-#      that file is a local/merged config, not a pushed policy file.
+#   2. Has device-group markers WITHOUT deviceconfig -> pushed-device-group.
 #   3. Root <config> containing deviceconfig/system or mgt-config ->
-#      local-config (the device's own running configuration).
-#   4. Root <config> with none of the above -> config-unclassified; still
-#      fragmented (prefix UNCLASS) so nothing is silently dropped, but
-#      flagged for human review in the manifest.
-#   5. Anything else -> other (ignored for fragmenting, listed in
-#      manifest).
+#      local-config.
+#   4. Root <config> with none of the above -> config-unclassified.
+#   5. Anything else -> other.
 function Classify-PanXml {
-    param([xml]$Doc, [string]$FileName)   # FileName kept for future
-                                          # diagnostics; NOT used for
-                                          # classification by design.
+    param([xml]$Doc, [string]$FileName)   # FileName kept for diagnostics
     $root = $Doc.DocumentElement.Name
     $hasDeviceconfig = $Doc.SelectNodes("//deviceconfig/system").Count -gt 0
     $hasMgtConfig    = $Doc.SelectNodes("//mgt-config").Count -gt 0
@@ -447,6 +444,62 @@ function Classify-PanXml {
     if ($root -eq 'config' -and ($hasDeviceconfig -or $hasMgtConfig)) { return 'local-config' }
     if ($root -eq 'config')                  { return 'config-unclassified' }
     return 'other'
+}
+
+# Path-first roles matching Build-CombinedConfig Get-BundleRole / SPEC.
+function Get-PathBundleRole {
+    param([string]$Rel)
+    $r = $Rel.Replace('\', '/').ToLower()
+    $base = [IO.Path]::GetFileName($r)
+    if ($r -eq 'running-config.xml') { return 'LOCAL' }
+    if ($r.StartsWith('template/') -and $base -eq 'template-config.xml') { return 'TEMPLATE' }
+    if ($r.StartsWith('template/')) { return 'TEMPLATE-VARIANT' }
+    if ($r.StartsWith('sp/shared/') -and $base -eq 'sp-config.xml') { return 'SP-SHARED' }
+    if ($r.StartsWith('sp/') -and $base -eq 'sp-config.xml') { return 'SP-DG' }
+    if ($r.StartsWith('sp/')) { return 'SP-VARIANT' }
+    return 'OTHER'
+}
+
+function Get-SpDgVsysName {
+    param([string]$Rel)
+    $parts = $Rel.Replace('\', '/').Split('/')
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        if ($parts[$i] -eq 'sp' -and ($i + 1) -lt $parts.Length) {
+            $name = $parts[$i + 1]
+            if ($name -and $name -ne 'shared') { return $name }
+        }
+    }
+    return $null
+}
+
+# Resolve fragment role: path-first for real layouts; content fallback otherwise.
+# Returns @{ Role = ...; Fragmentable = $bool; Vsys = ... }
+function Resolve-FragmentRole {
+    param([string]$Rel, [xml]$Doc, [string]$FileName)
+    $pathRole = Get-PathBundleRole -Rel $Rel
+    switch ($pathRole) {
+        'LOCAL' {
+            return @{ Role = 'local-config'; Fragmentable = $true; Vsys = $null }
+        }
+        'TEMPLATE' {
+            return @{ Role = 'pushed-template'; Fragmentable = $true; Vsys = $null }
+        }
+        'SP-SHARED' {
+            return @{ Role = 'pushed-device-group'; Fragmentable = $true; Vsys = 'shared' }
+        }
+        'SP-DG' {
+            return @{ Role = 'pushed-device-group'; Fragmentable = $true; Vsys = (Get-SpDgVsysName -Rel $Rel) }
+        }
+        'TEMPLATE-VARIANT' {
+            return @{ Role = 'ignored-variant'; Fragmentable = $false; Vsys = $null }
+        }
+        'SP-VARIANT' {
+            return @{ Role = 'ignored-variant'; Fragmentable = $false; Vsys = $null }
+        }
+    }
+    $contentRole = Classify-PanXml -Doc $Doc -FileName $FileName
+    $frag = $contentRole -in @('local-config', 'pushed-template', 'pushed-device-group', 'config-unclassified')
+    return @{ Role = $contentRole; Fragmentable = $frag; Vsys = $null }
 }
 
 # Replace the text of every secret-bearing element with 'REDACTED'.
@@ -568,30 +621,27 @@ foreach ($item in $inputs) {
             }
     }
 
-    # --- Steps 2-3: inventory + classify every file by CONTENT ----------
+    # --- Steps 2-3: inventory + classify (path-first, content fallback) -
     $allFiles = Get-ChildItem $extractDir -Recurse -File
     foreach ($f in $allFiles) {
         $role = 'non-xml'
         $rootEl = ''
-        # A file is XML-candidate if its extension says so OR its first
-        # line starts like XML - bundle internals do not always carry
-        # .xml extensions, so extension alone cannot be trusted.
+        $vsysTag = $null
         if ($f.Extension -eq '.xml' -or (Get-Content $f.FullName -TotalCount 1 -ErrorAction SilentlyContinue) -match '^\s*<\?xml|^\s*<') {
             try {
-                # -Raw: one string, not a line array; [xml] parses it.
                 [xml]$doc = Get-Content $f.FullName -Raw
                 $rootEl = $doc.DocumentElement.Name
-                $role = Classify-PanXml -Doc $doc -FileName $f.Name
-                # Keep every classified config for fragmenting - including
-                # config-unclassified, so nothing is silently dropped.
-                if ($role -in 'local-config', 'pushed-template', 'pushed-device-group', 'config-unclassified') {
-                    $sourceXmls += [pscustomobject]@{ File = $f; Doc = $doc; Role = $role }
+                $rel = $f.FullName.Substring($extractDir.Length).TrimStart('\', '/').Replace('\', '/')
+                $resolved = Resolve-FragmentRole -Rel $rel -Doc $doc -FileName $f.Name
+                $role = $resolved.Role
+                $vsysTag = $resolved.Vsys
+                if ($resolved.Fragmentable) {
+                    $sourceXmls += [pscustomobject]@{
+                        File = $f; Doc = $doc; Role = $role; Rel = $rel; Vsys = $vsysTag
+                    }
                 }
-            } catch { $role = 'xml-parse-failed' }   # recorded, not fatal
+            } catch { $role = 'xml-parse-failed' }
         }
-        # Every file goes in the manifest regardless of role, with its
-        # path relative to _extracted (Substring strips the prefix), its
-        # line count, and its hash.
         $manifest.Add([pscustomobject]@{
             Kind = 'source-file'; Name = $f.FullName.Substring($extractDir.Length + 1)
             Role = $role; RootElement = $rootEl
@@ -600,26 +650,29 @@ foreach ($item in $inputs) {
         })
     }
 
-    # Sanity gate: a device bundle with no identifiable local config
-    # means classification failed or the export is not what we think it
-    # is. Warn loudly; the manifest shows what WAS found.
     if (-not ($sourceXmls | Where-Object Role -eq 'local-config')) {
         Write-Warning "No local-config identified in $($item.Name). Check manifest before proceeding."
     }
 
+    $dgTotal = @($sourceXmls | Where-Object Role -eq 'pushed-device-group').Count
+    $dgIndex = 0
+
     # --- Step 4: fragment extraction from every classified source -------
     foreach ($src in $sourceXmls) {
-        # Role -> fragment filename prefix. This prefix is how source
-        # attribution (template vs local) survives into the AI sessions.
         $prefix = switch ($src.Role) {
             'local-config'        { 'LOCAL' }
             'pushed-template'     { 'TEMPLATE' }
             'pushed-device-group' { 'DEVGROUP' }
             default               { 'UNCLASS' }
         }
+        if ($src.Role -eq 'pushed-device-group' -and $dgTotal -gt 1) {
+            $dgIndex++
+            $stem = if ($src.Vsys) { $src.Vsys } else {
+                ([IO.Path]::GetFileNameWithoutExtension($src.File.Name) -replace '[^A-Za-z0-9._-]+', '_')
+            }
+            $prefix = ("DEVGROUP_{0:D2}_{1}" -f $dgIndex, $stem)
+        }
 
-        # Step 5 (redaction) runs BEFORE any fragment is written, on the
-        # in-memory document only. _extracted\ files stay untouched.
         $redactedCount = 0
         if ($Redact) { $redactedCount = Redact-Xml -Doc $src.Doc }
 
@@ -631,31 +684,18 @@ foreach ($item in $inputs) {
                     $found = $true
                     $i = 0
                     foreach ($node in $nodes) {
-                        # Multiple hits (e.g. one zone block per vsys) get
-                        # _0, _1... suffixes; a single hit gets none.
                         $suffix = if ($nodes.Count -gt 1) { "_$i" } else { '' }
-                        # Filename note: the backtick in "$prefix`_" ends
-                        # the variable name so PowerShell reads $prefix
-                        # then a literal underscore, not a variable named
-                        # $prefix_. The .xml.txt double extension keeps
-                        # the content XML while satisfying USAI's txt-only
-                        # upload filter.
                         $outFile = Join-Path $fragDir "$prefix`_$fragName$suffix.xml.txt"
                         Save-Fragment -Node $node -OutFile $outFile
                         $manifest.Add([pscustomobject]@{
                             Kind = 'fragment'; Name = "fragments\$prefix`_$fragName$suffix.xml.txt"
                             Role = $src.Role; RootElement = $node.Name
-                            # Line count feeds the AI-side truncation
-                            # check: the model must confirm it received
-                            # exactly this many lines.
                             Lines = (Get-Content $outFile | Measure-Object).Count
                             SHA256 = Get-Sha256 $outFile
                             Detail = "xpath=$xpath; from=$($src.File.Name)"
                         })
                         $i++
                     }
-                    # First matching XPath wins for this fragment name;
-                    # remaining XPaths are alternatives, not additions.
                     break
                 }
             }

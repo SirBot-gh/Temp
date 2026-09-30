@@ -1,0 +1,606 @@
+<#
+.SYNOPSIS
+  Emit logical 01-08 component chunks from a PAN-OS device-state bundle
+  for limited-AI conversations (additive to Build-CombinedConfig).
+
+.DESCRIPTION
+  LOGICAL COMPONENT CHUNK MODE for one chat per config domain. Does not
+  replace Build-CombinedConfig.ps1 (full combined / single-upload mode).
+  Fine-grained LOCAL_/TEMPLATE_/DEVGROUP_ fragments remain in
+  Split-PanBundle.ps1.
+
+  Authoritative sources (path-first; ignore pretrans / variants):
+    LOCAL     = root running-config.xml only (local-only; not Panorama)
+    TEMPLATE  = template/template-config.xml (Network + Device)
+    SP-SHARED = sp/shared/sp-config.xml
+    SP-DG     = sp/<vsys>/sp-config.xml for each vsys
+
+  Chunk map:
+    08-vsys-inventory              (written first; absences + pointers)
+    01-policies-security           LOCAL + SP security layers
+    02-policies-nat-pbf-qos        LOCAL + SP NAT / PBF / QoS
+    03-policies-decryption-dos-other  LOCAL + SP decryption / DoS / other
+    04-objects-address-service-app LOCAL + SP address/service/app objects
+    05-objects-profiles            LOCAL + SP profile objects
+    06-network                     TEMPLATE + LOCAL network sections
+    07-device                      TEMPLATE + LOCAL device sections
+
+  Policies/Objects: merge LOCAL with matching SP (never SP-only or
+  local-only when both exist). Network/Device: merge template with local.
+  Each chunk starts with a provenance header. Splits only on logical
+  xpath/section boundaries. -MaxKb is an in-component fallback only.
+
+.PARAMETER InputPath
+  A .tgz / .tar.gz file, or a folder of them.
+
+.PARAMETER OutputPath
+  Folder for per-bundle chunk output. Created if missing.
+
+.PARAMETER MaxKb
+  Optional in-component size fallback. When a finished logical chunk
+  exceeds this many KiB, rewrite it as .partNN.txt on section boundaries.
+  Default 0 = disabled (no size split).
+
+.PARAMETER Redact
+  Mask secret-bearing elements (same list as Build-CombinedConfig).
+  Default: on. Pass -Redact:$false only for local debugging.
+
+.EXAMPLE
+  .\Build-ComponentChunks.ps1 -InputPath .\tests\fixtures\FW-TEST_device_state.tgz -OutputPath .\chunks-out
+
+.EXAMPLE
+  Get-Help .\Build-ComponentChunks.ps1 -Full
+
+.NOTES
+  Windows PowerShell 5.1 and PowerShell 7+. Requires tar.exe.
+  Keep $RedactElements identical to the other toolkit scripts.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$InputPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath,
+
+    [int]$MaxKb = 0,
+
+    [bool]$Redact = $true
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$RedactElements = @(
+    'phash', 'password', 'passwd', 'pwd', 'bind-password', 'secret',
+    'shared-secret', 'admin-password', 'auth-password', 'priv-password',
+    'authpwd', 'privpwd', 'community', 'snmp-community-string',
+    'private-key', 'public-key', 'client-key', 'master-key',
+    'certificate-key', 'passphrase', 'preshared-key', 'pre-shared-key',
+    'esp-auth-key', 'ah-auth-key', 'key', 'api-key', 'token',
+    'credential', 'cookie', 'seed'
+)
+
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+# Extractor tables: section name -> XPath (first match wins per source).
+$PolicyKinds01 = @('security')
+$PolicyKinds02 = @('nat', 'pbf', 'qos')
+$PolicyKinds03 = @('decryption', 'application-override', 'dos', 'tunnel-inspect', 'sdwan')
+
+$ObjectXPaths04 = [ordered]@{
+    'address'           = '//address[entry]'
+    'address-group'     = '//address-group[entry]'
+    'service'           = '//service[entry]'
+    'service-group'     = '//service-group[entry]'
+    'application'       = '//application[entry]'
+    'application-group' = '//application-group[entry]'
+}
+
+$ObjectXPaths05 = [ordered]@{
+    'virus'                    = '//profiles/virus[entry]'
+    'spyware'                  = '//profiles/spyware[entry]'
+    'vulnerability'            = '//profiles/vulnerability[entry]'
+    'url-filtering'            = '//profiles/url-filtering[entry]'
+    'file-blocking'            = '//profiles/file-blocking[entry]'
+    'wildfire-analysis'        = '//profiles/wildfire-analysis[entry]'
+    'data-filtering'           = '//profiles/data-filtering[entry]'
+    'hip-profiles'             = '//hip-profiles[entry]'
+    'custom-url-category'      = '//profiles/custom-url-category[entry]'
+    'decryption'               = '//profiles/decryption[entry]'
+    'profile-group'            = '//profile-group[entry]'
+}
+
+$NetworkXPaths = [ordered]@{
+    'interface'                      = '//network/interface'
+    'interface-management-profile'   = '//network/profiles/interface-management-profile'
+    'zone'                           = '//vsys/entry/zone[entry]|//zone[entry]'
+    'zone-protection-profile'        = '//network/profiles/zone-protection-profile'
+    'virtual-router'                 = '//network/virtual-router'
+    'global-protect'                 = '//vsys/entry/global-protect|//global-protect'
+}
+
+$DeviceXPaths = [ordered]@{
+    'deviceconfig-system'       = '//deviceconfig/system'
+    'setting-management'        = '//deviceconfig/setting/management'
+    'service-routes'            = '//deviceconfig/system/route'
+    'high-availability'         = '//deviceconfig/high-availability'
+    'mgt-config'                = '//mgt-config'
+    'admin-role'                = '//shared/admin-role[entry]|//admin-role[entry]'
+    'authentication-profile'    = '//shared/authentication-profile[entry]|//authentication-profile[entry]'
+    'server-profile'            = '//shared/server-profile[entry]|//server-profile[entry]'
+    'certificate-profile'       = '//shared/certificate-profile[entry]|//certificate-profile[entry]'
+    'ssl-tls-service-profile'   = '//shared/ssl-tls-service-profile[entry]|//ssl-tls-service-profile[entry]'
+    'certificate'               = '//shared/certificate[entry]|//certificate[entry]'
+    'snmp-setting'              = '//deviceconfig/system/snmp-setting|//snmp-setting'
+    'log-settings'              = '//shared/log-settings|//log-settings'
+}
+
+function Get-BundleRole([string]$Rel) {
+    $r = $Rel.Replace('\', '/').ToLower()
+    $base = [IO.Path]::GetFileName($r)
+    if ($r -eq 'running-config.xml') { return 'LOCAL' }
+    if ($r.StartsWith('template/') -and $base -eq 'template-config.xml') { return 'TEMPLATE' }
+    if ($r.StartsWith('template/')) { return 'TEMPLATE-VARIANT' }
+    if ($r.StartsWith('sp/shared/') -and $base -eq 'sp-config.xml') { return 'SP-SHARED' }
+    if ($r.StartsWith('sp/') -and $base -eq 'sp-config.xml') { return 'SP-DG' }
+    if ($r.StartsWith('sp/')) { return 'SP-VARIANT' }
+    return 'SUPPLEMENTARY'
+}
+
+function Get-SpDgVsys([string]$Rel) {
+    $parts = $Rel.Replace('\', '/').Split('/')
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        if ($parts[$i] -eq 'sp' -and ($i + 1) -lt $parts.Length) {
+            $name = $parts[$i + 1]
+            if ($name -and $name -ne 'shared') { return $name }
+        }
+    }
+    return 'vsys'
+}
+
+function Get-BundleBaseName([string]$Name) {
+    $n = $Name
+    foreach ($ext in @('.tar.gz', '.tgz', '.tar', '.gz')) {
+        if ($n.ToLower().EndsWith($ext)) {
+            return $n.Substring(0, $n.Length - $ext.Length)
+        }
+    }
+    return [IO.Path]::GetFileNameWithoutExtension($n)
+}
+
+function Expand-SafeTar([string]$Archive, [string]$Dest) {
+    New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    & tar -xzf $Archive -C $Dest 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        & tar -xf $Archive -C $Dest
+        if ($LASTEXITCODE -ne 0) { throw "tar failed on $Archive" }
+    }
+}
+
+function Invoke-RedactDoc([System.Xml.XmlDocument]$Doc) {
+    $n = 0
+    foreach ($name in $RedactElements) {
+        foreach ($node in $Doc.SelectNodes("//*[local-name()='$name']")) {
+            $node.InnerText = 'REDACTED'
+            $n++
+        }
+    }
+    return $n
+}
+
+function ConvertTo-PrettyXml([System.Xml.XmlNode]$Node) {
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.OmitXmlDeclaration = $true
+    $settings.NewLineChars = "`n"
+    $sb = New-Object System.Text.StringBuilder
+    $writer = [System.Xml.XmlWriter]::Create($sb, $settings)
+    try { $Node.WriteTo($writer) }
+    finally { $writer.Close() }
+    return $sb.ToString()
+}
+
+function Import-ChunkBundle([string]$BundlePath, [string]$WorkDir) {
+    Expand-SafeTar -Archive $BundlePath -Dest $WorkDir
+    $files = @{}
+    Get-ChildItem -LiteralPath $WorkDir -Recurse -File | ForEach-Object {
+        if (-not $_.Name.ToLower().EndsWith('.xml')) { return }
+        $rel = $_.FullName.Substring($WorkDir.Length).TrimStart('\', '/').Replace('\', '/')
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.PreserveWhitespace = $true
+        try { $doc.Load($_.FullName) } catch { return }
+        $role = Get-BundleRole $rel
+        if (-not $files.ContainsKey($role)) {
+            $files[$role] = New-Object System.Collections.Generic.List[object]
+        }
+        $files[$role].Add([pscustomobject]@{ Rel = $rel; Root = $doc.DocumentElement; Doc = $doc })
+    }
+    return $files
+}
+
+function Add-SectionBlock {
+    param(
+        [System.Collections.Generic.List[string]]$Lines,
+        [string]$LayerTag,
+        [string]$SectionName,
+        [string]$SourceRel,
+        [System.Xml.XmlNode]$Node
+    )
+    [void]$Lines.Add('')
+    [void]$Lines.Add(("=== LAYER: {0} | section: {1} | from: {2} ===" -f $LayerTag, $SectionName, $SourceRel))
+    [void]$Lines.Add((ConvertTo-PrettyXml $Node))
+}
+
+function Select-FirstNodes([System.Xml.XmlNode]$Root, [string]$XPath) {
+    if (-not $Root) { return @() }
+    # Support simple alternation a|b without compiling full XPath unions poorly on PS 5.1.
+    $parts = $XPath.Split('|')
+    foreach ($p in $parts) {
+        $xp = $p.Trim()
+        if (-not $xp) { continue }
+        $nodes = $Root.SelectNodes($xp)
+        if ($nodes -and $nodes.Count -gt 0) { return @($nodes) }
+    }
+    return @()
+}
+
+function Get-PolicyLayerNodes {
+    param(
+        [System.Xml.XmlNode]$Root,
+        [string]$Layer,   # pre-rulebase | rulebase | post-rulebase
+        [string]$Kind
+    )
+    if (-not $Root) { return @() }
+    $xp = ".//${Layer}/${Kind}"
+    $nodes = $Root.SelectNodes($xp)
+    if ($nodes -and $nodes.Count -gt 0) { return @($nodes) }
+    return @()
+}
+
+function Write-ChunkFile {
+    param(
+        [string]$OutDir,
+        [string]$ChunkId,
+        [string[]]$HeaderLines,
+        [System.Collections.Generic.List[string]]$BodyLines,
+        [int]$MaxKbLimit
+    )
+    $all = New-Object System.Collections.Generic.List[string]
+    foreach ($h in $HeaderLines) { [void]$all.Add($h) }
+    foreach ($b in $BodyLines) { [void]$all.Add($b) }
+    if ($all.Count -eq $HeaderLines.Count) {
+        [void]$all.Add('# (no matching sections found in authoritative sources)')
+    }
+
+    $text = ($all -join "`n") + "`n"
+    $bytes = $Utf8NoBom.GetByteCount($text)
+    $maxBytes = if ($MaxKbLimit -gt 0) { $MaxKbLimit * 1024 } else { 0 }
+
+    if ($maxBytes -le 0 -or $bytes -le $maxBytes) {
+        $path = Join-Path $OutDir ($ChunkId + '.xml.txt')
+        [IO.File]::WriteAllText($path, $text, $Utf8NoBom)
+        return @($path)
+    }
+
+    # In-component fallback: split on === LAYER boundaries only.
+    $sections = New-Object System.Collections.Generic.List[object]
+    $cur = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $all) {
+        if ($line.StartsWith('=== LAYER:') -and $cur.Count -gt 0) {
+            $sections.Add(($cur -join "`n"))
+            $cur = New-Object System.Collections.Generic.List[string]
+        }
+        [void]$cur.Add($line)
+    }
+    if ($cur.Count -gt 0) { $sections.Add(($cur -join "`n")) }
+
+    $paths = New-Object System.Collections.Generic.List[string]
+    $part = 1
+    $buf = New-Object System.Collections.Generic.List[string]
+    foreach ($h in $HeaderLines) { [void]$buf.Add($h) }
+    [void]$buf.Add(("# part of oversized chunk; MaxKb={0}" -f $MaxKbLimit))
+
+    foreach ($sec in $sections) {
+        # Skip re-adding the shared header block from the first section.
+        $secLines = $sec -split "`n"
+        $candidate = ($buf + $secLines) -join "`n"
+        if ($Utf8NoBom.GetByteCount($candidate) -gt $maxBytes -and $buf.Count -gt ($HeaderLines.Count + 1)) {
+            $path = Join-Path $OutDir ("{0}.part{1:D2}.xml.txt" -f $ChunkId, $part)
+            [IO.File]::WriteAllText($path, (($buf -join "`n") + "`n"), $Utf8NoBom)
+            $paths.Add($path)
+            $part++
+            $buf = New-Object System.Collections.Generic.List[string]
+            foreach ($h in $HeaderLines) { [void]$buf.Add($h) }
+            [void]$buf.Add(("# continuation part {0}; MaxKb={1}" -f $part, $MaxKbLimit))
+        }
+        foreach ($sl in $secLines) {
+            if ($HeaderLines -contains $sl) { continue }
+            if ($sl -match '^# CHUNK:' -or $sl -match '^# Bundle:' -or $sl -match '^# Sources:' -or
+                $sl -match '^# Vsys:' -or $sl -match '^# Layers:' -or $sl -match '^# Absences:' -or
+                $sl -match '^# Generated:' -or $sl -eq '#') { continue }
+            [void]$buf.Add($sl)
+        }
+    }
+    $path = Join-Path $OutDir ("{0}.part{1:D2}.xml.txt" -f $ChunkId, $part)
+    [IO.File]::WriteAllText($path, (($buf -join "`n") + "`n"), $Utf8NoBom)
+    $paths.Add($path)
+    return @($paths)
+}
+
+function Get-ChunkProvenanceHeader {
+    param(
+        [string]$ChunkId,
+        [string]$BundleBase,
+        [string]$SourcesJoined,
+        [string]$VsysJoined,
+        [string]$Layers,
+        [string]$AbsencesJoined,
+        [string]$Generated,
+        [int]$RedTotal
+    )
+    return @(
+        "# CHUNK: $ChunkId"
+        "# Bundle: $BundleBase"
+        "# Sources: $SourcesJoined"
+        "# Vsys: $VsysJoined"
+        "# Layers: $Layers"
+        "# Absences: $AbsencesJoined"
+        "# Generated: $Generated | RedactedValues: $RedTotal"
+        '# Merge: policies/objects = LOCAL+SP when both exist; network/device = TEMPLATE+LOCAL'
+        '# Order: SP/DG pre-rulebase -> local rulebase -> SP/DG post-rulebase'
+        '#'
+    )
+}
+
+function Build-ChunksForBundle {
+    param([string]$Bundle, [string]$OutRoot, [int]$MaxKbLimit, [bool]$DoRedact)
+
+    $base = Get-BundleBaseName ([IO.Path]::GetFileName($Bundle))
+    $bundleOut = Join-Path $OutRoot $base
+    $work = Join-Path $bundleOut '_work'
+    if (Test-Path -LiteralPath $bundleOut) { Remove-Item -LiteralPath $bundleOut -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $bundleOut | Out-Null
+
+    try {
+        $files = Import-ChunkBundle -BundlePath $Bundle -WorkDir $work
+        $one = {
+            param($role)
+            if ($files.ContainsKey($role) -and $files[$role].Count -gt 0) { return $files[$role][0] }
+            return $null
+        }
+        $Litem = & $one 'LOCAL'
+        $Titem = & $one 'TEMPLATE'
+        $Sitem = & $one 'SP-SHARED'
+        $L = if ($Litem) { $Litem.Root } else { $null }
+        $T = if ($Titem) { $Titem.Root } else { $null }
+        $S = if ($Sitem) { $Sitem.Root } else { $null }
+        $Lrel = if ($Litem) { $Litem.Rel } else { $null }
+        $Trel = if ($Titem) { $Titem.Rel } else { $null }
+        $Srel = if ($Sitem) { $Sitem.Rel } else { $null }
+
+        $spDgs = New-Object System.Collections.Generic.List[object]
+        if ($files.ContainsKey('SP-DG')) {
+            foreach ($item in $files['SP-DG']) {
+                $spDgs.Add([pscustomobject]@{
+                    Vsys = (Get-SpDgVsys $item.Rel); Rel = $item.Rel; Root = $item.Root; Doc = $item.Doc
+                })
+            }
+        }
+        $spDgs = @($spDgs | Sort-Object Vsys)
+
+        $redTotal = 0
+        if ($DoRedact) {
+            foreach ($role in @('LOCAL', 'TEMPLATE', 'SP-SHARED', 'SP-DG')) {
+                if (-not $files.ContainsKey($role)) { continue }
+                foreach ($item in $files[$role]) {
+                    $redTotal += Invoke-RedactDoc $item.Doc
+                }
+            }
+        }
+
+        $vsysList = New-Object System.Collections.Generic.List[string]
+        if ($L) {
+            foreach ($v in $L.SelectNodes('//vsys/entry')) {
+                $n = $v.GetAttribute('name')
+                if ($n) { [void]$vsysList.Add($n) }
+            }
+        }
+        foreach ($dg in $spDgs) {
+            if ($vsysList -notcontains $dg.Vsys) { [void]$vsysList.Add($dg.Vsys) }
+        }
+        if ($vsysList.Count -eq 0) { [void]$vsysList.Add('vsys1') }
+
+        $absences = New-Object System.Collections.Generic.List[string]
+        if (-not $L) { [void]$absences.Add('LOCAL(running-config.xml)') }
+        if (-not $T) { [void]$absences.Add('TEMPLATE(template/template-config.xml)') }
+        if (-not $S) { [void]$absences.Add('SP-SHARED(sp/shared/sp-config.xml)') }
+        if ($spDgs.Count -eq 0) { [void]$absences.Add('SP-DG(sp/<vsys>/sp-config.xml)') }
+
+        $sourcePaths = New-Object System.Collections.Generic.List[string]
+        if ($Lrel) { [void]$sourcePaths.Add($Lrel) }
+        if ($Trel) { [void]$sourcePaths.Add($Trel) }
+        if ($Srel) { [void]$sourcePaths.Add($Srel) }
+        foreach ($dg in $spDgs) { [void]$sourcePaths.Add($dg.Rel) }
+
+        $index = New-Object System.Collections.Generic.List[string]
+        $gen = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+        $written = New-Object System.Collections.Generic.List[string]
+
+        # ---- 08 inventory first ----
+        $invBody = New-Object System.Collections.Generic.List[string]
+        [void]$invBody.Add('# Present sources:')
+        foreach ($p in $sourcePaths) { [void]$invBody.Add("#   - $p") }
+        [void]$invBody.Add('# Vsys list:')
+        foreach ($v in $vsysList) { [void]$invBody.Add("#   - $v") }
+        [void]$invBody.Add('# Absences:')
+        if ($absences.Count -eq 0) { [void]$invBody.Add('#   (none)') }
+        else { foreach ($a in $absences) { [void]$invBody.Add("#   - $a") } }
+        [void]$invBody.Add('# Ignored by design: **/pretrans*, ha-transform*, last-pushed-sp-config.xml')
+        [void]$invBody.Add('# Chunk pointers:')
+        foreach ($id in @(
+            '01-policies-security', '02-policies-nat-pbf-qos', '03-policies-decryption-dos-other',
+            '04-objects-address-service-app', '05-objects-profiles', '06-network', '07-device'
+        )) {
+            [void]$invBody.Add("#   - $id.xml.txt")
+        }
+        $hdr08 = @(
+            '# CHUNK: 08-vsys-inventory'
+            "# Bundle: $base"
+            "# Sources: $($sourcePaths -join ', ')"
+            "# Vsys: $($vsysList -join ', ')"
+            '# Layers: inventory'
+            "# Absences: $(if ($absences.Count) { $absences -join ', ' } else { 'none' })"
+            "# Generated: $gen | RedactedValues: $redTotal"
+            '#'
+        )
+        foreach ($p in (Write-ChunkFile $bundleOut '08-vsys-inventory' $hdr08 $invBody 0)) {
+            $written.Add([IO.Path]::GetFileName($p))
+        }
+
+        function New-ProvHeader([string]$ChunkId, [string]$Layers) {
+            return @(
+                "# CHUNK: $ChunkId"
+                "# Bundle: $base"
+                "# Sources: $($sourcePaths -join ', ')"
+                "# Vsys: $($vsysList -join ', ')"
+                "# Layers: $Layers"
+                "# Absences: $(if ($absences.Count) { $absences -join ', ' } else { 'none' })"
+                "# Generated: $gen | RedactedValues: $redTotal"
+                '# Merge: policies/objects = LOCAL+SP when both exist; network/device = TEMPLATE+LOCAL'
+                '# Order: SP/DG pre-rulebase -> local rulebase -> SP/DG post-rulebase'
+                '#'
+            )
+        }
+
+        # ---- 01 / 02 / 03 policies ----
+        $policyMaps = @(
+            @{ Id = '01-policies-security'; Kinds = $PolicyKinds01 },
+            @{ Id = '02-policies-nat-pbf-qos'; Kinds = $PolicyKinds02 },
+            @{ Id = '03-policies-decryption-dos-other'; Kinds = $PolicyKinds03 }
+        )
+        foreach ($pm in $policyMaps) {
+            $body = New-Object System.Collections.Generic.List[string]
+            foreach ($kind in $pm.Kinds) {
+                if ($S) {
+                    foreach ($n in (Get-PolicyLayerNodes $S 'pre-rulebase' $kind)) {
+                        Add-SectionBlock $body 'sp-shared' "pre-rulebase/$kind" $Srel $n
+                    }
+                }
+                foreach ($dg in $spDgs) {
+                    foreach ($n in (Get-PolicyLayerNodes $dg.Root 'pre-rulebase' $kind)) {
+                        Add-SectionBlock $body ("sp-vsys-{0}" -f $dg.Vsys) "pre-rulebase/$kind" $dg.Rel $n
+                    }
+                }
+                if ($L) {
+                    foreach ($n in (Get-PolicyLayerNodes $L 'rulebase' $kind)) {
+                        Add-SectionBlock $body 'local' "rulebase/$kind" $Lrel $n
+                    }
+                }
+                foreach ($dg in $spDgs) {
+                    foreach ($n in (Get-PolicyLayerNodes $dg.Root 'post-rulebase' $kind)) {
+                        Add-SectionBlock $body ("sp-vsys-{0}" -f $dg.Vsys) "post-rulebase/$kind" $dg.Rel $n
+                    }
+                }
+                if ($S) {
+                    foreach ($n in (Get-PolicyLayerNodes $S 'post-rulebase' $kind)) {
+                        Add-SectionBlock $body 'sp-shared' "post-rulebase/$kind" $Srel $n
+                    }
+                }
+            }
+            $absJoin = if ($absences.Count) { $absences -join ', ' } else { 'none' }
+            $hdr = Get-ChunkProvenanceHeader $pm.Id $base ($sourcePaths -join ', ') ($vsysList -join ', ') 'local|sp-shared|sp-vsysN' $absJoin $gen $redTotal
+            foreach ($p in (Write-ChunkFile $bundleOut $pm.Id $hdr $body $MaxKbLimit)) {
+                $written.Add([IO.Path]::GetFileName($p))
+            }
+        }
+
+        # ---- 04 / 05 objects (LOCAL + SP) ----
+        foreach ($pair in @(
+            @{ Id = '04-objects-address-service-app'; Map = $ObjectXPaths04 },
+            @{ Id = '05-objects-profiles'; Map = $ObjectXPaths05 }
+        )) {
+            $body = New-Object System.Collections.Generic.List[string]
+            foreach ($sec in $pair.Map.Keys) {
+                $xp = $pair.Map[$sec]
+                if ($S) {
+                    foreach ($n in (Select-FirstNodes $S $xp)) {
+                        Add-SectionBlock $body 'sp-shared' $sec $Srel $n
+                    }
+                }
+                foreach ($dg in $spDgs) {
+                    foreach ($n in (Select-FirstNodes $dg.Root $xp)) {
+                        Add-SectionBlock $body ("sp-vsys-{0}" -f $dg.Vsys) $sec $dg.Rel $n
+                    }
+                }
+                if ($L) {
+                    foreach ($n in (Select-FirstNodes $L $xp)) {
+                        Add-SectionBlock $body 'local' $sec $Lrel $n
+                    }
+                }
+            }
+            $absJoin = if ($absences.Count) { $absences -join ', ' } else { 'none' }
+            $hdr = Get-ChunkProvenanceHeader $pair.Id $base ($sourcePaths -join ', ') ($vsysList -join ', ') 'local|sp-shared|sp-vsysN' $absJoin $gen $redTotal
+            foreach ($p in (Write-ChunkFile $bundleOut $pair.Id $hdr $body $MaxKbLimit)) {
+                $written.Add([IO.Path]::GetFileName($p))
+            }
+        }
+
+        # ---- 06 network / 07 device (TEMPLATE + LOCAL) ----
+        foreach ($pair in @(
+            @{ Id = '06-network'; Map = $NetworkXPaths },
+            @{ Id = '07-device'; Map = $DeviceXPaths }
+        )) {
+            $body = New-Object System.Collections.Generic.List[string]
+            foreach ($sec in $pair.Map.Keys) {
+                $xp = $pair.Map[$sec]
+                if ($T) {
+                    foreach ($n in (Select-FirstNodes $T $xp)) {
+                        Add-SectionBlock $body 'template' $sec $Trel $n
+                    }
+                }
+                if ($L) {
+                    foreach ($n in (Select-FirstNodes $L $xp)) {
+                        Add-SectionBlock $body 'local' $sec $Lrel $n
+                    }
+                }
+            }
+            $absJoin = if ($absences.Count) { $absences -join ', ' } else { 'none' }
+            $hdr = Get-ChunkProvenanceHeader $pair.Id $base ($sourcePaths -join ', ') ($vsysList -join ', ') 'template|local' $absJoin $gen $redTotal
+            foreach ($p in (Write-ChunkFile $bundleOut $pair.Id $hdr $body $MaxKbLimit)) {
+                $written.Add([IO.Path]::GetFileName($p))
+            }
+        }
+
+        $idxPath = Join-Path $bundleOut 'COMPONENT_INDEX.txt'
+        $idxLines = @(
+            "COMPONENT INDEX for $base"
+            "Generated: $gen"
+            "Mode: logical component chunks (limited-AI). Full combined: Build-CombinedConfig.ps1"
+            "Sources: $($sourcePaths -join ', ')"
+            "Absences: $(if ($absences.Count) { $absences -join ', ' } else { 'none' })"
+            'Files:'
+        )
+        foreach ($w in $written) { $idxLines += "  $w" }
+        [IO.File]::WriteAllText($idxPath, (($idxLines -join "`n") + "`n"), $Utf8NoBom)
+        Write-Host ("{0} -> {1}  ({2} chunk files)" -f [IO.Path]::GetFileName($Bundle), $bundleOut, $written.Count)
+    }
+    finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# ---- main ----
+New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
+if (Test-Path -LiteralPath $InputPath -PathType Container) {
+    $inputs = @(Get-ChildItem -LiteralPath $InputPath -File |
+        Where-Object { $_.Extension -in '.tgz', '.gz', '.tar' -or $_.Name -like '*.tar.gz' })
+} else {
+    $inputs = @(Get-Item -LiteralPath $InputPath)
+}
+if (-not $inputs) { throw "No .tgz/.tar.gz inputs at $InputPath" }
+
+foreach ($item in $inputs) {
+    Build-ChunksForBundle -Bundle $item.FullName -OutRoot $OutputPath -MaxKbLimit $MaxKb -DoRedact $Redact
+}
