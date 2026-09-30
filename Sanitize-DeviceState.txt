@@ -9,6 +9,14 @@
   regex safety-net pass, verifies output, and writes MANIFEST.txt plus MANIFEST.json.
   Output is well-formed XML text with a .txt extension for tools that reject .xml.
 
+  Sanitizes EVERY XML file (including pretrans variants) so secrets cannot leak.
+  Manifest roles are path-first when the coworker device-state layout is present:
+    local-config       = root running-config.xml (local-only; not Panorama-inclusive)
+    pushed-template    = template/template-config.xml
+    pushed-device-group = sp/shared|vsys*/sp-config.xml
+    ignored-variant    = pretrans / ha-transform / last-pushed under template/ or sp/
+  Content-based classification remains fallback for flat layouts.
+
   Per-bundle output under OutputRoot\<bundle-name>\:
     *.txt           sanitized XML text (relative paths preserved; .xml -> .txt)
     MANIFEST.txt    human-readable summary (upload-safe)
@@ -286,8 +294,31 @@ function Read-XmlText {
     return $Utf8NoBom.GetString($bytes, $offset, $bytes.Length - $offset)
 }
 
+function Get-PathBundleRole {
+    param([string]$Rel)
+
+    $r = $Rel.Replace('\', '/').ToLower()
+    $base = [IO.Path]::GetFileName($r)
+    if ($r -eq 'running-config.xml') { return 'local-config' }
+    if ($r.StartsWith('template/') -and $base -eq 'template-config.xml') { return 'pushed-template' }
+    if ($r.StartsWith('template/')) { return 'ignored-variant' }
+    if ($r.StartsWith('sp/shared/') -and $base -eq 'sp-config.xml') { return 'pushed-device-group' }
+    if ($r.StartsWith('sp/') -and $base -eq 'sp-config.xml') { return 'pushed-device-group' }
+    if ($r.StartsWith('sp/')) { return 'ignored-variant' }
+    return $null
+}
+
 function Classify-PanXml {
-    param([System.Xml.XmlDocument]$Doc)
+    param(
+        [System.Xml.XmlDocument]$Doc,
+        [string]$RelPath = ''
+    )
+
+    # Path-first when RelPath is under a real device-state layout.
+    if ($RelPath) {
+        $pathRole = Get-PathBundleRole -Rel $RelPath
+        if ($null -ne $pathRole) { return $pathRole }
+    }
 
     $root = $Doc.DocumentElement.Name
     $hasDeviceconfig = $Doc.SelectNodes('//deviceconfig/system').Count -gt 0
@@ -646,7 +677,7 @@ function Process-Bundle {
                 $doc.PreserveWhitespace = $true
                 $doc.LoadXml($rawText)
 
-                $role = Classify-PanXml -Doc $doc
+                $role = Classify-PanXml -Doc $doc -RelPath $rel
                 $tier1 = Invoke-Tier1Redaction -Doc $doc
                 $tier2 = 0
 
