@@ -1,0 +1,146 @@
+# PAN-OS Management Access Assessment: H1 to H6 Prompts
+
+**Baseline:** Palo Alto's published administrative-access best practices.
+**Input:** one `.combined.txt` per device, one session per device.
+**Output per hypothesis:** CONFIRMED / REFUTED / NOT-DETERMINABLE, with cited section and row. That verdict is the tracker cell.
+
+Run P0 first. Then H1 through H6 in order.
+
+---
+
+## P0: Integrity and platform
+
+```
+I've uploaded a combined Palo Alto firewall configuration. Before analysis:
+
+1. Reproduce the GROUND-TRUTH COUNTS block from the header exactly.
+2. State the file's first line, last line, and total line count.
+3. Confirm the SECURITY POLICY row count equals the sum of the rules_* counts.
+4. From the SYSTEM section, state the hostname and identify whether this is a VM-Series (Azure) or a physical appliance, citing the row that tells you (model, serial format, or platform fields).
+
+For the rest of this session: cite the section and row for every claim. If something is marked absent in the file, use the default the file states. If a section or row simply does not exist, say NOT-IN-FILE and draw no conclusion from it. If a control lives outside this config (identity provider MFA, Azure NSG, upstream ACLs, SIEM), say NOT-DETERMINABLE.
+```
+
+Check the numbers against the file. Proceed only if they match.
+
+---
+
+## H1: MGT reachable only from approved sources
+
+```
+Hypothesis H1: The MGT interface's permitted-ip list is non-empty and contains only a small, consistent set of administrative sources.
+
+From the SYSTEM section: state the MGT ip-address and every permitted-ip entry with its SRC tag. If permitted-ip is marked absent, state explicitly that ALL sources can reach MGT and mark H1 REFUTED.
+
+If present: list the entries and classify each as a single host (/32), a subnet, or a broad range (/16 or wider, or 0.0.0.0/0). Any broad range is a REFUTED condition. Note that Panorama's address legitimately belongs in this list; do not flag it.
+
+Do not reference security policy. It is not evaluated for MGT traffic.
+
+Verdict: CONFIRMED / REFUTED, with cited rows.
+```
+
+---
+
+## H2: Only secure services on MGT
+
+```
+Hypothesis H2: Only HTTPS and SSH (and optionally ping) are enabled on the MGT interface. HTTP and Telnet are disabled.
+
+From the SYSTEM section: state the values of disable-http and disable-telnet, and any other service flags present. Both HTTP and Telnet are ENABLED unless the value is explicitly yes. State SNMP presence from the SNMP section and its version if present.
+
+Verdict: CONFIRMED if disable-http=yes and disable-telnet=yes. REFUTED otherwise. Cite rows.
+```
+
+---
+
+## H3: Management isolated behind a bastion or dedicated network
+
+```
+Hypothesis H3: The permitted-ip sources from H1 are a bastion host or a dedicated management subnet, not a general user network.
+
+From the H1 entries and the STATIC ROUTES, INTERFACES and ZONES sections: for each permitted-ip entry, is it a /32 (consistent with a bastion), or does it overlap any subnet assigned to a data-plane interface in a trust or user zone (inconsistent with isolation)? Cite rows.
+
+This hypothesis cannot be fully determined from firewall config. Mark NOT-DETERMINABLE for the parts that need the network diagram or, for an Azure VM-Series, the management NIC's public IP assignment and NSG rules. State exactly which external evidence would settle it.
+
+Verdict: CONFIRMED / REFUTED / NOT-DETERMINABLE, with cited rows and the external evidence list.
+```
+
+---
+
+## H4: No data-plane interface answers management from untrusted sources
+
+```
+Hypothesis H4: Every interface management profile has a permitted-ip list, no profile is bound to an untrust or internet-facing interface, and security policy to any profile-bearing interface is source-restricted.
+
+Part A (profiles). From INTERFACES, INTERFACE MANAGEMENT PROFILES and ZONES: list every interface whose MGMT-PROFILE is not "-", with its IP, zone, the profile's SERVICES-ENABLED, and PERMITTED-IP. If PERMITTED-IP reads ABSENT(=all sources), say so in those words. For each, is the zone untrust or internet-facing (public IP, or zone named untrust/outside/internet)? Interfaces with no profile deny management by default; do not list them.
+
+Part B (policy). For each interface from Part A: find every SECURITY POLICY row whose DEST covers the interface IP (DEST=any, or an address object or group that resolves to it via ADDRESS OBJECTS / ADDRESS GROUPS). Resolve SERVICE via SERVICE OBJECTS / SERVICE GROUPS and state whether it covers tcp/443, tcp/22, or is any/application-default. Show them in evaluation order and name the first match.
+
+Part C (default). PAN-OS allows intrazone traffic by default. For each interface from Part A, is there an explicit rule denying intrazone traffic to its IP on management ports? If not, every host in that interface's zone can reach the management service unless the profile's permitted-ip restricts it. State which gate (profile or policy) is actually doing the restricting, or whether neither is.
+
+Part D (NAT). Any NAT POLICY row whose DST-XLATE targets the MGT IP or any Part A interface IP.
+
+If there are no profile-bearing interfaces at all, state that and mark H4 CONFIRMED.
+
+Verdict per interface: effective reachable sources = the narrower of profile permitted-ip and policy source. H4 is REFUTED if any interface in an untrust zone has any management service effectively reachable, or if any profile has no permitted-ip and no restricting policy. Cite rows.
+```
+
+---
+
+## H5: MFA and credential hygiene
+
+```
+Hypothesis H5: Administrators authenticate through a central service with MFA, accounts are individual, the built-in admin is not in active use, and lockout and idle timeout are set.
+
+From ADMIN USERS, AUTHENTICATION PROFILES, SERVER PROFILES, PASSWORD COMPLEXITY and MANAGEMENT SETTINGS:
+
+a. Every admin account with ROLE, AUTH-PROFILE and SRC. Count superusers. Is an account literally named "admin" present, and is it bound to an authentication profile or local only?
+b. Authentication method (local / radius / tacplus / ldap / saml / kerberos) and the server profile it references.
+c. MFA: any factor configured on-box? If the method is RADIUS or SAML, mark MFA NOT-DETERMINABLE and state that enforcement lives on the identity provider.
+d. Accounts that look shared or generic (netadmin, service, ops, etc.).
+e. admin-lockout failed-attempts and lockout-time, or "lockout disabled" if absent.
+f. idle-timeout, or "60-minute default" if absent.
+g. password-complexity enabled and minimum-length, or "not enforced" if absent.
+
+Verdict: CONFIRMED only if central auth is in use, no shared accounts, lockout and idle timeout are set, and admin is not local-only. MFA is reported separately as NOT-DETERMINABLE where applicable. Cite rows.
+```
+
+---
+
+## H6: Panorama enforces uniformly, no weakening overrides
+
+```
+Hypothesis H6: All management-plane settings are template-enforced with no local override that weakens them.
+
+a. State the "Sources merged" header line. If TEMPLATE, SP-SHARED or SP-DG is MISSING, say which earlier hypotheses are unreliable as a result.
+b. Reproduce APPENDIX A in full. For each DRIFT=yes row, state whether the local value is more or less restrictive than the template value, judging only permitted-ip, service disables, lockout, idle-timeout, and management profile settings. For other objects say "not a management-plane control".
+c. For each DRIFT=no row: "locked from Panorama management, identical value" (latent risk: a future template hardening push will not reach it).
+d. List every row in SYSTEM, MANAGEMENT SETTINGS, ADMIN USERS and INTERFACE MANAGEMENT PROFILES whose SRC is LOCAL. These are unmanaged by Panorama.
+
+Verdict: CONFIRMED if Appendix A has no weakening drift and no management-plane setting is LOCAL-only. REFUTED otherwise. Cite rows.
+```
+
+---
+
+## Close: findings for this device
+
+```
+From H1 through H6, list findings. One per line: hypothesis, verdict, config source (TEMPLATE / LOCAL / LOCAL-OVERRIDE), what the file shows, cited rows. No severity, no recommendations. Never claim a security rule protects the MGT interface. Reachability is inferred from configuration, not confirmed.
+```
+
+---
+
+## Tracker
+
+One row per device:
+
+| Device | Platform | H1 | H2 | H3 | H4-A | H4-B | H5 | H6 | Azure mgmt NIC public IP | NSG inbound 443/22 sources |
+|---|---|---|---|---|---|---|---|---|---|---|
+
+Cells: CONFIRMED / REFUTED / NOT-DETERMINABLE plus the cited row. The last two columns come from Azure, not the config; N/A for physical.
+
+## Outside the config (data requests)
+
+- Azure: management NIC public IP assignment and effective NSG rules per VM-Series.
+- Physical: management VLAN upstream ACLs or the network diagram.
+- All: admin authentication logs, 30 to 60 days, source IP on every success and failure. Config says who can reach the login page; logs say who has.
