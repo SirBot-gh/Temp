@@ -1,50 +1,50 @@
 <#
 .SYNOPSIS
-    Converts a Palo Alto Networks PAN-OS device state export into a readable .txt report.
+    Redacts secrets in a Palo Alto Networks PAN-OS configuration / device state XML file.
 
 .DESCRIPTION
-    Accepts a device state bundle (.tgz / .tar.gz / .tar), an already-extracted folder,
-    or a single PAN-OS config .xml file. Every XML file in the bundle is read:
+    Reads one PAN-OS XML file (running-config.xml, a saved or exported configuration, template/template-config.xml,
+    sp/<vsys>/sp-config.xml, or any other XML file from a device state export) and writes a copy in which every
+    secret value is replaced by ********. Nothing else changes: element order, attributes, comments, processing
+    instructions, whitespace and the XML declaration are preserved, so the output is still a valid PAN-OS config.
 
-      running-config.xml            Local firewall config (incl. local overrides)
-      template/*.xml                Panorama template / template stack config pushed to the
-                                    firewall (normally template/template-config.xml)
-      sp/<vsys>/*.xml               Panorama device-group ("shared policy") config pushed to
-                                    the firewall (normally sp/vsys1/sp-config.xml); contains
-                                    pre-rulebase, post-rulebase and the Panorama objects
-      merged-running-config.xml     Local + template merge (found in tech support files)
-      anything else (*.xml)         Supporting files (certificate_info, satellite_info,
-                                    device_blacklist, knob-setting, ...) rendered generically
+    Masked by element / attribute name (case-insensitive, namespace prefixes ignored): phash, password, passwd,
+    passphrase, secret, key, psk, authkey, api-key, community, anything ending in -key, -password, -secret,
+    -passphrase, -psk, pwd, passwd or keytab, anything containing community, and private-key*.
+    Not masked: public-key (certificates / SSH public keys), key-id, ssh-key-id.
+    Name/value lists (<entry name="Password"><value>..</value></entry>, as used by ddns-vendor-config, mfa-config
+    and HTTP log-forwarding headers/params) mask the <value> when the entry name contains secret, passw, passphrase,
+    psk, phash, token, key, community or authorization.
+    This covers admin password hashes, IKE pre-shared keys, IPsec manual keys (ESP/AH auth and encryption keys),
+    SNMP community strings and SNMPv3 auth/priv passwords, LDAP bind / RADIUS / TACACS+ secrets, NTP authentication
+    keys, OSPF/BGP authentication, certificate private keys, Kerberos keytabs, PPPoE and proxy passwords, API keys.
 
-    The report is plain text (UTF-8 with BOM, CRLF line endings) so it opens cleanly in
-    Notepad. Secrets (phash, key, password, secret, private-key and similar elements) are
-    always masked as ********.
+    Only leaf values are masked: a container such as <pre-shared-key> or <auto-key> keeps its child elements and
+    the secret leaf inside it (<key>) is masked.
+
+    Files that contain a DOCTYPE are rejected: PAN-OS never emits one, and inline entities could bypass the masking.
 
     Works in Windows PowerShell 5.1 and PowerShell 7+ (Windows/Linux/macOS), no modules.
 
 .PARAMETER Path
-    Device state .tgz/.tar.gz/.tar, an extracted folder, or a single .xml file.
+    Input PAN-OS XML file.
 
 .PARAMETER OutFile
-    Combined report path. Default: <hostname>-device-state.txt next to the input.
+    Output file. Default: <input name>.redacted.xml next to the input. The output is never written over the input
+    and never replaces an existing file unless -Force is given.
 
-.PARAMETER PerSourceFiles
-    Also write one .txt per source file next to OutFile (<OutFile base>.<source>.txt).
-
-.PARAMETER KeepExtracted
-    Keep the temporary extraction folder (its path is printed).
-
-.PARAMETER NoTar
-    Skip tar.exe and use the built-in .NET extractor (normally only used as a fallback).
+.PARAMETER Force
+    Allow overwriting an existing output file, including redacting the input file in place.
 
 .EXAMPLE
-    .\Convert-PanDeviceState.ps1 -Path .\export.tgz -OutFile .\PA-NGFW-01.txt
+    .\Convert-PanDeviceState.ps1 -Path .\running-config.xml
+    Writes .\running-config.redacted.xml
 
 .EXAMPLE
-    .\Convert-PanDeviceState.ps1 -Path C:\exports\device_state_cfg.tgz -PerSourceFiles
+    .\Convert-PanDeviceState.ps1 -Path C:\exports\FW-01\template\template-config.xml -OutFile C:\share\template-config.xml
 
 .EXAMPLE
-    Get-ChildItem C:\exports\*.tgz | ForEach-Object { .\Convert-PanDeviceState.ps1 -Path $_.FullName }
+    Get-ChildItem C:\exports -Recurse -Filter *.xml | ForEach-Object { .\Convert-PanDeviceState.ps1 -Path $_.FullName }
 #>
 [CmdletBinding()]
 param(
@@ -52,9 +52,7 @@ param(
     [string]$Path,
     [Parameter(Position = 1)]
     [string]$OutFile,
-    [switch]$PerSourceFiles,
-    [switch]$KeepExtracted,
-    [switch]$NoTar
+    [switch]$Force
 )
 
 Set-StrictMode -Version 1.0
@@ -66,145 +64,7 @@ $script:SecretExclude = '^(public-key|key-id|ssh-key-id)$'
 # "Password", "Duo Secret Key", "Token", "Authorization"; only the <value> leaf of such an entry is masked.
 $script:SecretEntryNamePattern = '(secret|passw|passphrase|psk|phash|token|key|community|authorization)'
 $script:Mask = '********'
-$script:Out = $null
-$script:Rules = New-Object System.Collections.ArrayList
-$script:ScriptVersion = '1.0'
-
-# ---------------------------------------------------------------- output helpers
-function W {
-    param([string]$Line = '')
-    [void]$script:Out.Add($Line)
-}
-function H1 { param([string]$t) W ''; W ('=' * 100); W $t; W ('=' * 100) }
-function H2 { param([string]$t) W ''; W ('-' * 100); W $t; W ('-' * 100) }
-function H3 { param([string]$t) W ''; W ('### ' + $t) }
-
-function Wrap-Text {
-    param([string]$Text, [int]$Width)
-    $res = New-Object System.Collections.Generic.List[string]
-    if ($null -eq $Text) { $Text = '' }
-    foreach ($para in ($Text -split "`r?`n")) {
-        if ($Width -le 0 -or $para.Length -le $Width) { $res.Add($para); continue }
-        $rest = $para
-        while ($rest.Length -gt $Width) {
-            $cut = $rest.LastIndexOf(' ', $Width)
-            if ($cut -lt [int]($Width / 3)) { $cut = $Width }
-            $res.Add($rest.Substring(0, $cut).TrimEnd())
-            $rest = $rest.Substring($cut).TrimStart()
-        }
-        if ($rest.Length -gt 0) { $res.Add($rest) }
-    }
-    return ,$res.ToArray()
-}
-
-# Rows: array of arrays. A cell may be a string or a string array (one item per line).
-function Write-TextTable {
-    param([string[]]$Headers, [object[]]$Rows, [int[]]$MaxWidths)
-    if (-not $Rows -or $Rows.Count -eq 0) { W '  (none)'; return }
-    $n = $Headers.Count
-    $cellLines = @()
-    foreach ($r in $Rows) {
-        $lineSet = @()
-        for ($i = 0; $i -lt $n; $i++) {
-            $v = $null
-            if ($i -lt @($r).Count) { $v = @($r)[$i] }
-            $max = 0
-            if ($MaxWidths -and $i -lt $MaxWidths.Count) { $max = $MaxWidths[$i] }
-            $ls = New-Object System.Collections.Generic.List[string]
-            foreach ($item in @($v)) {
-                if ($null -eq $item) { continue }
-                foreach ($w in (Wrap-Text -Text ([string]$item) -Width $max)) { $ls.Add($w) }
-            }
-            if ($ls.Count -eq 0) { $ls.Add('') }
-            $lineSet += ,($ls.ToArray())
-        }
-        $cellLines += ,$lineSet
-    }
-    $widths = New-Object int[] $n
-    for ($i = 0; $i -lt $n; $i++) { $widths[$i] = $Headers[$i].Length }
-    foreach ($ls in $cellLines) {
-        for ($i = 0; $i -lt $n; $i++) {
-            foreach ($l in $ls[$i]) { if ($l.Length -gt $widths[$i]) { $widths[$i] = $l.Length } }
-        }
-    }
-    $fmt = {
-        param($cells)
-        $parts = for ($i = 0; $i -lt $n; $i++) { ([string]$cells[$i]).PadRight($widths[$i]) }
-        ('  ' + ($parts -join ' | ')).TrimEnd()
-    }
-    W (& $fmt $Headers)
-    $sep = for ($i = 0; $i -lt $n; $i++) { '-' * $widths[$i] }
-    W ('  ' + ($sep -join '-+-'))
-    $first = $true
-    foreach ($ls in $cellLines) {
-        $height = 1
-        foreach ($c in $ls) { if ($c.Count -gt $height) { $height = $c.Count } }
-        $multi = $false
-        foreach ($c in $cellLines) { foreach ($x in $c) { if ($x.Count -gt 1) { $multi = $true } } }
-        if ($multi -and -not $first) { W ('  ' + ($sep -join '-+-')) }
-        for ($k = 0; $k -lt $height; $k++) {
-            $cells = for ($i = 0; $i -lt $n; $i++) { if ($k -lt $ls[$i].Count) { $ls[$i][$k] } else { '' } }
-            W (& $fmt $cells)
-        }
-        $first = $false
-    }
-}
-
-# ---------------------------------------------------------------- XML helpers
-function Kids {
-    param($Node)
-    if ($null -eq $Node) { return @() }
-    $list = @()
-    foreach ($c in $Node.ChildNodes) { if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element) { $list += $c } }
-    return $list
-}
-function Kid {
-    param($Node, [string]$Name)
-    if ($null -eq $Node) { return $null }
-    foreach ($c in $Node.ChildNodes) {
-        if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element -and $c.LocalName -eq $Name) { return $c }
-    }
-    return $null
-}
-function Get-Node {
-    param($Node, [string]$PathSpec)
-    $cur = $Node
-    foreach ($p in ($PathSpec -split '/')) {
-        if ($p -eq '') { continue }
-        $cur = Kid $cur $p
-        if ($null -eq $cur) { return $null }
-    }
-    return $cur
-}
-function Get-Text {
-    param($Node, [string]$PathSpec)
-    $n = $Node
-    if ($PathSpec) { $n = Get-Node $Node $PathSpec }
-    if ($null -eq $n) { return '' }
-    if ((Kids $n).Count -gt 0) { return '' }
-    return $n.InnerText.Trim()
-}
-function Get-Members {
-    param($Node, [string]$PathSpec)
-    $n = $Node
-    if ($PathSpec) { $n = Get-Node $Node $PathSpec }
-    if ($null -eq $n) { return @() }
-    $m = @()
-    foreach ($k in (Kids $n)) {
-        if ($k.LocalName -eq 'member') { $m += $k.InnerText.Trim() }
-        elseif ($k.LocalName -eq 'entry') { $m += $k.GetAttribute('name') }
-    }
-    if ($m.Count -eq 0 -and $n.InnerText.Trim() -ne '' -and (Kids $n).Count -eq 0) { $m += $n.InnerText.Trim() }
-    return $m
-}
-function Entries {
-    param($Node, [string]$PathSpec)
-    $n = $Node
-    if ($PathSpec) { $n = Get-Node $Node $PathSpec }
-    if ($null -eq $n) { return @() }
-    return @(Kids $n | Where-Object { $_.LocalName -eq 'entry' })
-}
-function EName { param($e) return $e.GetAttribute('name') }
+$script:ScriptVersion = '2.0'
 
 function Protect-Secrets {
     param([System.Xml.XmlDocument]$Doc)
@@ -220,7 +80,8 @@ function Protect-Secrets {
                     if (($t.NodeType -eq [System.Xml.XmlNodeType]::Text -or $t.NodeType -eq [System.Xml.XmlNodeType]::CDATA) -and $t.Value.Trim() -ne '') { $t.Value = $script:Mask; $count++ }
                 }
             }
-            foreach ($a in @($el.Attributes)) { if ($a.Name -ne 'name') { $a.Value = $script:Mask } }
+            # xml:space / xml:lang / xmlns declarations are never secrets and masking them makes the output invalid XML.
+            foreach ($a in @($el.Attributes)) { if ($a.Name -ne 'name' -and $a.Prefix -ne 'xml' -and $a.Prefix -ne 'xmlns' -and $a.Name -ne 'xmlns') { $a.Value = $script:Mask } }
         }
         # Name/value lists (ddns-vendor-config, mfa-config, http headers/params): <entry name="Password"><value>..</value></entry>
         if ($el.LocalName -eq 'entry' -and $el.HasAttribute('name') -and $el.GetAttribute('name') -match $script:SecretEntryNamePattern) {
@@ -238,902 +99,62 @@ function Protect-Secrets {
     return $count
 }
 
-# Generic indented renderer: nothing is ever dropped.
-function Write-Tree {
-    param($Node, [int]$Indent = 2, [string[]]$Skip = @())
-    $pad = ' ' * $Indent
-    foreach ($c in (Kids $Node)) {
-        if ($Skip -contains $c.LocalName) { continue }
-        $label = $c.LocalName
-        if ($c.LocalName -eq 'entry' -and $c.HasAttribute('name')) { $label = "entry '" + $c.GetAttribute('name') + "'" }
-        $attrs = @()
-        foreach ($a in @($c.Attributes)) {
-            if ($c.LocalName -eq 'entry' -and $a.Name -eq 'name') { continue }
-            $attrs += ($a.Name + '=' + $a.Value)
-        }
-        if ($attrs.Count -gt 0) { $label += ' [' + ($attrs -join ', ') + ']' }
-        $kids = Kids $c
-        if ($kids.Count -eq 0) {
-            $v = $c.InnerText.Trim()
-            if ($v -eq '') { W ($pad + $label + ' (set)') }
-            else {
-                $vl = @($v -split "`r?`n")
-                if ($vl.Count -gt 1) {
-                    W ($pad + $label + ':')
-                    foreach ($l in $vl) { W ($pad + '    ' + $l.TrimEnd()) }
-                } else { W ($pad + $label + ': ' + $v) }
-            }
-            continue
-        }
-        $onlyMembers = $true
-        foreach ($k in $kids) { if ($k.LocalName -ne 'member' -or (Kids $k).Count -gt 0) { $onlyMembers = $false; break } }
-        if ($onlyMembers) {
-            W ($pad + $label + ': ' + ((@($kids | ForEach-Object { $_.InnerText.Trim() })) -join ', '))
-            continue
-        }
-        W ($pad + $label + ':')
-        Write-Tree -Node $c -Indent ($Indent + 4)
-    }
-}
-
-function Write-Generic {
-    param($Node, [string]$Title, [string]$Source)
-    H3 ("[$Source] " + $Title)
-    if ((Kids $Node).Count -eq 0) {
-        $v = $Node.InnerText.Trim()
-        if ($v -eq '') { W '  (empty)' } else { W ('  ' + $v) }
-        return
-    }
-    Write-Tree -Node $Node -Indent 2
-}
-
-function Join-Or { param($a, [string]$sep = ', ') $x = @($a); if ($x.Count -eq 0) { return '' } return ($x -join $sep) }
-
-# ---------------------------------------------------------------- global maps (zones / VRs)
-$script:ZoneOfIf = @{}
-$script:VrOfIf = @{}
-function Build-Maps {
-    param([System.Xml.XmlDocument]$Doc)
-    foreach ($z in @($Doc.SelectNodes("//zone/entry"))) {
-        $net = Kid $z 'network'
-        foreach ($t in (Kids $net)) {
-            foreach ($m in (Get-Members $t)) { if ($m -and -not $script:ZoneOfIf.ContainsKey($m)) { $script:ZoneOfIf[$m] = (EName $z) } }
-        }
-    }
-    foreach ($vr in @($Doc.SelectNodes("//virtual-router/entry"))) {
-        foreach ($m in (Get-Members $vr 'interface')) { if (-not $script:VrOfIf.ContainsKey($m)) { $script:VrOfIf[$m] = 'VR ' + (EName $vr) } }
-    }
-    foreach ($lr in @($Doc.SelectNodes("//logical-router/entry"))) {
-        foreach ($vrf in (Entries $lr 'vrf')) {
-            foreach ($m in (Get-Members $vrf 'interface')) { if (-not $script:VrOfIf.ContainsKey($m)) { $script:VrOfIf[$m] = 'LR ' + (EName $lr) + '/' + (EName $vrf) } }
-        }
-    }
-}
-
-# ---------------------------------------------------------------- specific renderers
-function Write-System {
-    param($Node, [string]$Source)
-    H3 "[$Source] System / management settings (deviceconfig > system)"
-    $pairs = @(
-        @('Hostname', 'hostname'), @('Domain', 'domain'), @('Mgmt IP', 'ip-address'), @('Netmask', 'netmask'),
-        @('Default gateway', 'default-gateway'), @('Mgmt IPv6', 'ipv6-address'), @('IPv6 gateway', 'ipv6-default-gateway'),
-        @('Mgmt speed/duplex', 'speed-duplex'), @('Timezone', 'timezone'), @('Login banner', 'login-banner'),
-        @('Update server', 'update-server'),
-        @('DNS primary', 'dns-setting/servers/primary'), @('DNS secondary', 'dns-setting/servers/secondary'),
-        @('NTP primary', 'ntp-servers/primary-ntp-server/ntp-server-address'),
-        @('NTP secondary', 'ntp-servers/secondary-ntp-server/ntp-server-address'),
-        @('Panorama server', 'panorama/local-panorama/panorama-server'),
-        @('Panorama server 2', 'panorama/local-panorama/panorama-server-2'),
-        @('Panorama server (legacy)', 'panorama-server'), @('Panorama server 2 (legacy)', 'panorama-server-2')
-    )
-    $rows = @()
-    foreach ($p in $pairs) {
-        $v = Get-Text $Node $p[1]
-        if ($v -ne '') { $rows += ,@($p[0], $v) }
-    }
-    $perm = Get-Node $Node 'permitted-ip'
-    if ($perm) { $rows += ,@('Permitted mgmt IPs', (Join-Or (Get-Members $perm))) }
-    if ($rows.Count -gt 0) { Write-TextTable -Headers @('Setting', 'Value') -Rows $rows -MaxWidths @(28, 70) }
-    W ''
-    W '  All system settings (full detail):'
-    Write-Tree -Node $Node -Indent 4
-}
-
-function Write-DeviceConfig {
-    param($Node, [string]$Source)
-    foreach ($c in (Kids $Node)) {
-        if ($c.LocalName -eq 'system') { Write-System -Node $c -Source $Source }
-        else { Write-Generic -Node $c -Title ("deviceconfig > " + $c.LocalName) -Source $Source }
-    }
-}
-
-function Get-IfRow {
-    param($Entry, [string]$Type, [string]$Parent)
-    $name = EName $Entry
-    $mode = ''; $tag = Get-Text $Entry 'tag'; $ips = @(); $mgmt = ''; $extra = @()
-    $modeNode = $null
-    foreach ($m in @('layer3', 'layer2', 'virtual-wire', 'tap', 'ha', 'decrypt-mirror', 'log-card', 'aggregate-group')) {
-        $mn = Kid $Entry $m
-        if ($mn) { $mode = $m; $modeNode = $mn; break }
-    }
-    if ($mode -eq 'aggregate-group') { $extra += ('member of ' + $modeNode.InnerText.Trim()); $mode = 'ae-member' }
-    $l3 = $Entry
-    if ($mode -eq 'layer3') { $l3 = $modeNode }
-    if ($mode -eq '' -and $Parent) { $mode = $Parent }
-    foreach ($ip in (Entries $l3 'ip')) { $ips += (EName $ip) }
-    foreach ($ip in (Entries $l3 'ipv6/address')) { $ips += (EName $ip) }
-    if (Kid $l3 'dhcp-client') { $ips += 'DHCP client' }
-    if (Kid $l3 'pppoe') { $ips += 'PPPoE' }
-    $mgmt = Get-Text $l3 'interface-management-profile'
-    if ($mgmt -eq '') { $mgmt = Get-Text $Entry 'interface-management-profile' }
-    $c = Get-Text $Entry 'comment'
-    if ($c) { $extra += $c }
-    $lp = Get-Text $Entry 'link-speed'; if ($lp) { $extra += ('speed ' + $lp) }
-    if ($modeNode -and (Kid $modeNode 'lacp')) { $extra += ('LACP ' + (Get-Text $modeNode 'lacp/mode')) }
-    $zone = ''; if ($script:ZoneOfIf.ContainsKey($name)) { $zone = $script:ZoneOfIf[$name] }
-    $vr = ''; if ($script:VrOfIf.ContainsKey($name)) { $vr = $script:VrOfIf[$name] }
-    return ,@($name, $Type, $mode, $tag, $ips, $zone, $vr, $mgmt, ($extra -join '; '))
-}
-
-function Write-Interfaces {
-    param($Node, [string]$Source)
-    H3 "[$Source] Interfaces (network > interface)"
-    $rows = @()
-    $handled = @('ethernet', 'aggregate-ethernet', 'vlan', 'loopback', 'tunnel')
-    foreach ($kind in @('ethernet', 'aggregate-ethernet')) {
-        foreach ($e in (Entries $Node $kind)) {
-            $typeLabel = 'physical'; if ($kind -eq 'aggregate-ethernet') { $typeLabel = 'aggregate (ae)' }
-            $rows += ,(Get-IfRow -Entry $e -Type $typeLabel)
-            foreach ($mode in @('layer3', 'layer2')) {
-                foreach ($u in (Entries $e "$mode/units")) { $rows += ,(Get-IfRow -Entry $u -Type 'subinterface' -Parent $mode) }
-            }
-        }
-    }
-    foreach ($kind in @('vlan', 'loopback', 'tunnel')) {
-        $k = Kid $Node $kind
-        if ($null -eq $k) { continue }
-        $units = Entries $k 'units'
-        foreach ($u in $units) { $rows += ,(Get-IfRow -Entry $u -Type ($kind + ' unit') -Parent 'layer3') }
-        if (@($units).Count -eq 0 -and (Kids $k).Count -gt 0 -and $null -eq (Kid $k 'units')) { $rows += ,(Get-IfRow -Entry $k -Type $kind -Parent 'layer3') }
-    }
-    Write-TextTable -Headers @('Interface', 'Type', 'Mode', 'VLAN tag', 'IP address(es)', 'Zone', 'VR / LR', 'Mgmt profile', 'Notes') -Rows $rows -MaxWidths @(22, 16, 14, 8, 22, 18, 18, 16, 36)
-    W '  (Zone / VR columns are looked up across all source files in this export.)'
-    W ''
-    W '  Interface detail (full):'
-    foreach ($c in (Kids $Node)) {
-        W ('    ' + $c.LocalName + ':')
-        Write-Tree -Node $c -Indent 8
-    }
-}
-
-function Write-StaticRoutes {
-    param($RtNode, [string]$Title)
-    $rows = @()
-    foreach ($af in @('ip', 'ipv6')) {
-        foreach ($r in (Entries $RtNode "$af/static-route")) {
-            $nh = ''
-            $nhn = Kid $r 'nexthop'
-            if ($nhn) {
-                $k = Kids $nhn
-                if (@($k).Count -gt 0) { $nh = @($k)[0].LocalName + ' ' + @($k)[0].InnerText.Trim() }
-            }
-            $rows += ,@((EName $r), $af, (Get-Text $r 'destination'), $nh.Trim(), (Get-Text $r 'interface'), (Get-Text $r 'metric'), (Get-Text $r 'admin-dist'), (Get-Text $r 'path-monitor/enable'))
-        }
-    }
-    W ('  ' + $Title)
-    Write-TextTable -Headers @('Route', 'AF', 'Destination', 'Next hop', 'Interface', 'Metric', 'Admin dist', 'Path mon') -Rows $rows -MaxWidths @(28, 4, 20, 30, 18, 6, 10, 8)
-}
-
-function Write-VirtualRouters {
-    param($Node, [string]$Source)
-    H3 "[$Source] Virtual routers (legacy routing engine)"
-    foreach ($vr in (Entries $Node)) {
-        W ''
-        W ("  Virtual router '" + (EName $vr) + "'")
-        W ('    Interfaces: ' + (Join-Or (Get-Members $vr 'interface')))
-        $rt = Kid $vr 'routing-table'
-        if ($rt) { Write-StaticRoutes -RtNode $rt -Title 'Static routes:' }
-        $other = Kids $vr | Where-Object { @('interface', 'routing-table') -notcontains $_.LocalName }
-        if (@($other).Count -gt 0) {
-            W '    Other VR settings (protocols, ECMP, admin distances, ...):'
-            foreach ($o in $other) { W ('      ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 10 }
-        }
-    }
-}
-
-function Write-LogicalRouters {
-    param($Node, [string]$Source)
-    H3 "[$Source] Logical routers (advanced routing engine)"
-    foreach ($lr in (Entries $Node)) {
-        W ''
-        W ("  Logical router '" + (EName $lr) + "'")
-        foreach ($vrf in (Entries $lr 'vrf')) {
-            W ("    VRF '" + (EName $vrf) + "'  interfaces: " + (Join-Or (Get-Members $vrf 'interface')))
-            $rt = Kid $vrf 'routing-table'
-            if ($rt) { Write-StaticRoutes -RtNode $rt -Title 'Static routes:' }
-            $other = Kids $vrf | Where-Object { @('interface', 'routing-table') -notcontains $_.LocalName }
-            foreach ($o in $other) { W ('      ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 10 }
-        }
-        $otherLr = Kids $lr | Where-Object { $_.LocalName -ne 'vrf' }
-        foreach ($o in $otherLr) { W ('    ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 8 }
-    }
-}
-
-function Write-VlanObjects {
-    param($Node, [string]$Source)
-    H3 "[$Source] Layer 2 VLAN objects (network > vlan)"
-    $rows = @()
-    foreach ($v in (Entries $Node)) {
-        $rows += ,@((EName $v), (Get-Members $v 'interface'), (Get-Text $v 'virtual-interface/interface'))
-    }
-    Write-TextTable -Headers @('VLAN object', 'Member interfaces', 'VLAN (L3) interface') -Rows $rows -MaxWidths @(30, 30, 24)
-    foreach ($v in (Entries $Node)) {
-        $other = Kids $v | Where-Object { @('interface', 'virtual-interface') -notcontains $_.LocalName }
-        foreach ($o in $other) { W ("  " + (EName $v) + ' > ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 6 }
-    }
-}
-
-function Write-Network {
-    param($Node, [string]$Source)
-    foreach ($c in (Sort-ByPriority (Kids $Node) @('interface', 'vlan', 'virtual-router', 'logical-router', 'profiles'))) {
-        switch ($c.LocalName) {
-            'interface' { Write-Interfaces -Node $c -Source $Source }
-            'virtual-router' { Write-VirtualRouters -Node $c -Source $Source }
-            'logical-router' { Write-LogicalRouters -Node $c -Source $Source }
-            'vlan' { Write-VlanObjects -Node $c -Source $Source }
-            'profiles' {
-                H3 "[$Source] Network profiles (network > profiles)"
-                foreach ($p in (Kids $c)) {
-                    W ('  ' + $p.LocalName + ': ' + (Join-Or (@(Entries $p) | ForEach-Object { EName $_ })))
-                    Write-Tree -Node $p -Indent 6
-                }
-            }
-            default { Write-Generic -Node $c -Title ('network > ' + $c.LocalName) -Source $Source }
-        }
-    }
-}
-
-function Write-Zones {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Zones ($Scope)"
-    $rows = @()
-    foreach ($z in (Entries $Node)) {
-        $net = Kid $z 'network'
-        $type = ''; $ifs = @()
-        foreach ($t in (Kids $net)) {
-            if (@('layer3', 'layer2', 'virtual-wire', 'tap', 'tunnel', 'external') -contains $t.LocalName) { $type = $t.LocalName; $ifs = Get-Members $t }
-        }
-        $zpp = Get-Text $net 'zone-protection-profile'
-        $lfp = Get-Text $net 'log-setting'
-        $uid = Get-Text $z 'enable-user-identification'
-        $rows += ,@((EName $z), $type, $ifs, $zpp, $uid, $lfp)
-    }
-    Write-TextTable -Headers @('Zone', 'Type', 'Interfaces', 'Zone protection', 'User-ID', 'Log setting') -Rows $rows -MaxWidths @(24, 12, 24, 20, 8, 20)
-    foreach ($z in (Entries $Node)) {
-        $net = Kid $z 'network'
-        $extraNet = Kids $net | Where-Object { @('layer3', 'layer2', 'virtual-wire', 'tap', 'tunnel', 'external', 'zone-protection-profile', 'log-setting') -notcontains $_.LocalName }
-        $extra = Kids $z | Where-Object { @('network', 'enable-user-identification') -notcontains $_.LocalName }
-        if (@($extraNet).Count + @($extra).Count -gt 0) {
-            W ("  Zone '" + (EName $z) + "' other settings:")
-            foreach ($o in $extraNet) { W ('      network > ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 10 }
-            foreach ($o in $extra) { W ('      ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 10 }
-        }
-    }
-}
-
-function Add-RuleRecord {
-    param([string]$Kind, [string]$Stage, [string]$Source, [string]$Scope, $Entry, [object[]]$Row)
-    [void]$script:Rules.Add([pscustomobject]@{ Kind = $Kind; Stage = $Stage; Source = $Source; Scope = $Scope; Name = (EName $Entry); Row = $Row })
-}
-
-function Get-StageRank { param([string]$s) switch ($s) { 'pre' { return 0 } 'local' { return 1 } 'post' { return 2 } default { return 3 } } }
-
-function Get-SecurityRow {
-    param($r)
-    $neg = ''
-    $src = Get-Members $r 'source'; if ((Get-Text $r 'negate-source') -eq 'yes') { $src = @('NOT:') + $src }
-    $dst = Get-Members $r 'destination'; if ((Get-Text $r 'negate-destination') -eq 'yes') { $dst = @('NOT:') + $dst }
-    $dis = Get-Text $r 'disabled'; if ($dis -eq '') { $dis = 'no' }
-    $rtype = Get-Text $r 'rule-type'
-    $act = Get-Text $r 'action'
-    if ($rtype) { $act = $act + ' (' + $rtype + ')' }
-    return ,@((EName $r), (Get-Members $r 'from'), (Get-Members $r 'to'), $src, $dst, (Get-Members $r 'application'), (Get-Members $r 'service'), $act, $dis, (Get-Text $r 'description'))
-}
-
-function Write-SecurityRules {
-    param($RulesNode, [string]$Source, [string]$Scope, [string]$Stage)
-    $rows = @(); $i = 0
-    $entries = Entries $RulesNode
-    foreach ($r in $entries) {
-        $i++
-        $row = Get-SecurityRow $r
-        Add-RuleRecord -Kind 'security' -Stage $Stage -Source $Source -Scope $Scope -Entry $r -Row $row
-        $rows += ,(@([string]$i) + $row)
-    }
-    Write-TextTable -Headers @('#', 'Name', 'From', 'To', 'Source', 'Destination', 'Application', 'Service', 'Action', 'Disabled', 'Description') -Rows $rows -MaxWidths @(4, 28, 16, 16, 22, 22, 20, 20, 18, 8, 40)
-    $shown = @('from', 'to', 'source', 'destination', 'application', 'service', 'action', 'disabled', 'description', 'negate-source', 'negate-destination', 'rule-type')
-    $i = 0
-    $hdr = $false
-    foreach ($r in $entries) {
-        $i++
-        $other = Kids $r | Where-Object { $shown -notcontains $_.LocalName }
-        $attrs = @(); foreach ($a in @($r.Attributes)) { if ($a.Name -ne 'name') { $attrs += ($a.Name + '=' + $a.Value) } }
-        if (@($other).Count -eq 0 -and $attrs.Count -eq 0) { continue }
-        if (-not $hdr) { W ''; W '  Rule details (fields not shown in the table):'; $hdr = $true }
-        W ("    #$i " + (EName $r) + $(if ($attrs.Count) { '  [' + ($attrs -join ', ') + ']' } else { '' }))
-        foreach ($o in $other) {
-            $tmp = $script:Out.Count
-            if ((Kids $o).Count -eq 0) { $v = $o.InnerText.Trim(); if ($v -eq '') { $v = '(set)' }; W ('        ' + $o.LocalName + ': ' + $v) }
-            else {
-                $onlyM = $true; foreach ($k in (Kids $o)) { if ($k.LocalName -ne 'member') { $onlyM = $false } }
-                if ($onlyM) { W ('        ' + $o.LocalName + ': ' + (Join-Or (Get-Members $o))) }
-                else { W ('        ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 12 }
-            }
-        }
-    }
-}
-
-function Get-NatRow {
-    param($r)
-    $st = ''
-    $s = Kid $r 'source-translation'
-    if ($s) {
-        foreach ($k in (Kids $s)) {
-            switch ($k.LocalName) {
-                'dynamic-ip-and-port' {
-                    $ia = Kid $k 'interface-address'
-                    if ($ia) { $st = 'DIPP intf ' + (Get-Text $ia 'interface') + ' ' + (Get-Text $ia 'ip') }
-                    else { $st = 'DIPP ' + (Join-Or (Get-Members $k 'translated-address')) }
-                }
-                'dynamic-ip' { $st = 'Dynamic IP ' + (Join-Or (Get-Members $k 'translated-address')) }
-                'static-ip' { $st = 'Static ' + (Get-Text $k 'translated-address'); if ((Get-Text $k 'bi-directional') -eq 'yes') { $st += ' (bi-dir)' } }
-                default { $st = $k.LocalName }
-            }
-        }
-    }
-    $dt = ''
-    $d = Kid $r 'destination-translation'
-    if ($d) { $dt = (Get-Text $d 'translated-address'); $p = Get-Text $d 'translated-port'; if ($p) { $dt += ':' + $p } }
-    $dd = Kid $r 'dynamic-destination-translation'
-    if ($dd) { $dt = 'dynamic ' + (Get-Text $dd 'translated-address'); $p = Get-Text $dd 'translated-port'; if ($p) { $dt += ':' + $p } }
-    $dis = Get-Text $r 'disabled'; if ($dis -eq '') { $dis = 'no' }
-    return ,@((EName $r), (Get-Members $r 'from'), (Get-Members $r 'to'), (Get-Text $r 'to-interface'), (Get-Members $r 'source'), (Get-Members $r 'destination'), (Get-Text $r 'service'), $st, $dt, $dis, (Get-Text $r 'description'))
-}
-
-function Write-NatRules {
-    param($RulesNode, [string]$Source, [string]$Scope, [string]$Stage)
-    $rows = @(); $i = 0
-    $entries = Entries $RulesNode
-    foreach ($r in $entries) {
-        $i++
-        $row = Get-NatRow $r
-        Add-RuleRecord -Kind 'nat' -Stage $Stage -Source $Source -Scope $Scope -Entry $r -Row $row
-        $rows += ,(@([string]$i) + $row)
-    }
-    Write-TextTable -Headers @('#', 'Name', 'From', 'To', 'To intf', 'Source', 'Destination', 'Service', 'Source translation', 'Dest translation', 'Disabled', 'Description') -Rows $rows -MaxWidths @(4, 26, 14, 14, 12, 20, 20, 16, 30, 24, 8, 36)
-    $shown = @('from', 'to', 'to-interface', 'source', 'destination', 'service', 'source-translation', 'destination-translation', 'dynamic-destination-translation', 'disabled', 'description')
-    $i = 0; $hdr = $false
-    foreach ($r in $entries) {
-        $i++
-        $other = Kids $r | Where-Object { $shown -notcontains $_.LocalName }
-        if (@($other).Count -eq 0) { continue }
-        if (-not $hdr) { W ''; W '  Rule details (fields not shown in the table):'; $hdr = $true }
-        W ("    #$i " + (EName $r))
-        foreach ($o in $other) { if ((Kids $o).Count -eq 0) { W ('        ' + $o.LocalName + ': ' + $o.InnerText.Trim()) } else { W ('        ' + $o.LocalName + ':'); Write-Tree -Node $o -Indent 12 } }
-    }
-}
-
-function Write-Rulebase {
-    param($Node, [string]$Source, [string]$Scope, [string]$Stage)
-    $stageLabel = switch ($Stage) { 'pre' { 'Panorama PRE-rulebase' } 'post' { 'Panorama POST-rulebase' } default { 'Local rulebase' } }
-    foreach ($rb in (Kids $Node)) {
-        $rules = Kid $rb 'rules'
-        $title = "[$Source] $stageLabel > " + $rb.LocalName + " rules ($Scope)"
-        if ($rb.LocalName -eq 'security' -and $rules) { H3 $title; Write-SecurityRules -RulesNode $rules -Source $Source -Scope $Scope -Stage $Stage }
-        elseif ($rb.LocalName -eq 'nat' -and $rules) { H3 $title; Write-NatRules -RulesNode $rules -Source $Source -Scope $Scope -Stage $Stage }
-        elseif ($rules) {
-            H3 $title
-            $i = 0
-            if (@(Entries $rules).Count -eq 0) { W '  (none)' }
-            foreach ($r in (Entries $rules)) {
-                $i++
-                W ("  #$i " + (EName $r))
-                Write-Tree -Node $r -Indent 6
-            }
-            $o = Kids $rb | Where-Object { $_.LocalName -ne 'rules' }
-            foreach ($x in $o) { W ('  ' + $x.LocalName + ':'); Write-Tree -Node $x -Indent 6 }
-        }
-        else { Write-Generic -Node $rb -Title ("$stageLabel > " + $rb.LocalName + " ($Scope)") -Source $Source }
-    }
-}
-
-function Write-Addresses {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Address objects ($Scope)"
-    $rows = @()
-    foreach ($a in (Entries $Node)) {
-        $type = ''; $val = ''
-        foreach ($t in @('ip-netmask', 'ip-range', 'ip-wildcard', 'fqdn')) { $v = Get-Text $a $t; if ($v -ne '') { $type = $t; $val = $v } }
-        $rows += ,@((EName $a), $type, $val, (Get-Members $a 'tag'), (Get-Text $a 'description'))
-    }
-    Write-TextTable -Headers @('Name', 'Type', 'Value', 'Tags', 'Description') -Rows $rows -MaxWidths @(30, 11, 30, 18, 44)
-}
-
-function Write-AddressGroups {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Address groups ($Scope)"
-    $rows = @()
-    foreach ($g in (Entries $Node)) {
-        $kind = 'static'; $mem = Get-Members $g 'static'
-        $dyn = Get-Text $g 'dynamic/filter'
-        if ($dyn) { $kind = 'dynamic'; $mem = @('filter: ' + $dyn) }
-        $rows += ,@((EName $g), $kind, $mem, (Get-Members $g 'tag'), (Get-Text $g 'description'))
-    }
-    Write-TextTable -Headers @('Group', 'Kind', 'Members / filter', 'Tags', 'Description') -Rows $rows -MaxWidths @(30, 8, 36, 18, 40)
-}
-
-function Write-Services {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Service objects ($Scope)"
-    $rows = @()
-    foreach ($s in (Entries $Node)) {
-        $proto = ''; $dport = ''; $sport = ''
-        $p = Kid $s 'protocol'
-        foreach ($k in (Kids $p)) { $proto = $k.LocalName; $dport = Get-Text $k 'port'; $sport = Get-Text $k 'source-port' }
-        $rows += ,@((EName $s), $proto, $dport, $sport, (Get-Members $s 'tag'), (Get-Text $s 'description'))
-    }
-    Write-TextTable -Headers @('Name', 'Protocol', 'Dest port(s)', 'Source port(s)', 'Tags', 'Description') -Rows $rows -MaxWidths @(30, 8, 24, 14, 18, 40)
-}
-
-function Write-ServiceGroups {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Service groups ($Scope)"
-    $rows = @()
-    foreach ($g in (Entries $Node)) { $rows += ,@((EName $g), (Get-Members $g 'members'), (Get-Members $g 'tag')) }
-    Write-TextTable -Headers @('Group', 'Members', 'Tags') -Rows $rows -MaxWidths @(30, 40, 20)
-}
-
-function Write-Tags {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Tags ($Scope)"
-    $rows = @()
-    foreach ($t in (Entries $Node)) { $rows += ,@((EName $t), (Get-Text $t 'color'), (Get-Text $t 'comments')) }
-    Write-TextTable -Headers @('Tag', 'Color', 'Comments') -Rows $rows -MaxWidths @(30, 10, 50)
-}
-
-function Write-SecProfiles {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Security profiles ($Scope)"
-    $sum = @()
-    foreach ($p in (Kids $Node)) { $sum += ,@($p.LocalName, @(Entries $p | ForEach-Object { EName $_ })) }
-    Write-TextTable -Headers @('Profile type', 'Profiles') -Rows $sum -MaxWidths @(28, 60)
-    W ''
-    W '  Profile detail:'
-    foreach ($p in (Kids $Node)) {
-        foreach ($e in (Entries $p)) { W ('    ' + $p.LocalName + " '" + (EName $e) + "':"); Write-Tree -Node $e -Indent 8 }
-        $nonEntry = Kids $p | Where-Object { $_.LocalName -ne 'entry' }
-        foreach ($x in $nonEntry) { W ('    ' + $p.LocalName + ' > ' + $x.LocalName + ':'); Write-Tree -Node $x -Indent 8 }
-    }
-}
-
-function Write-ProfileGroups {
-    param($Node, [string]$Source, [string]$Scope)
-    H3 "[$Source] Security profile groups ($Scope)"
-    $rows = @()
-    foreach ($g in (Entries $Node)) {
-        $parts = @(); foreach ($k in (Kids $g)) { $parts += ($k.LocalName + ': ' + (Join-Or (Get-Members $k))) }
-        $rows += ,@((EName $g), $parts)
-    }
-    Write-TextTable -Headers @('Group', 'Profiles') -Rows $rows -MaxWidths @(30, 70)
-}
-
-# Object scope = vsys, shared, Panorama-pushed <panorama>, device-group entry ...
-function Write-ObjectScope {
-    param($Node, [string]$Source, [string]$Scope)
-    $emptyNames = @()
-    foreach ($c in (Sort-ByPriority (Kids $Node) @('zone', 'pre-rulebase', 'rulebase', 'post-rulebase', 'address', 'address-group', 'service', 'service-group', 'tag', 'profiles', 'profile-group'))) {
-        if ((Kids $c).Count -eq 0 -and $c.InnerText.Trim() -eq '' -and $c.Attributes.Count -eq 0) { $emptyNames += $c.LocalName; continue }
-        switch ($c.LocalName) {
-            'zone' { Write-Zones -Node $c -Source $Source -Scope $Scope }
-            'address' { Write-Addresses -Node $c -Source $Source -Scope $Scope }
-            'address-group' { Write-AddressGroups -Node $c -Source $Source -Scope $Scope }
-            'service' { Write-Services -Node $c -Source $Source -Scope $Scope }
-            'service-group' { Write-ServiceGroups -Node $c -Source $Source -Scope $Scope }
-            'tag' { Write-Tags -Node $c -Source $Source -Scope $Scope }
-            'profiles' { Write-SecProfiles -Node $c -Source $Source -Scope $Scope }
-            'profile-group' { Write-ProfileGroups -Node $c -Source $Source -Scope $Scope }
-            'rulebase' { Write-Rulebase -Node $c -Source $Source -Scope $Scope -Stage 'local' }
-            'pre-rulebase' { Write-Rulebase -Node $c -Source $Source -Scope $Scope -Stage 'pre' }
-            'post-rulebase' { Write-Rulebase -Node $c -Source $Source -Scope $Scope -Stage 'post' }
-            default { Write-Generic -Node $c -Title ($c.LocalName + " ($Scope)") -Source $Source }
-        }
-    }
-    if ($emptyNames.Count -gt 0) { W ''; W ("  [$Source] Empty sections ($Scope): " + ($emptyNames -join ', ')) }
-}
-
-function Write-MgtConfig {
-    param($Node, [string]$Source)
-    H3 "[$Source] Management config (admins, password policy)"
-    $rows = @()
-    foreach ($u in (Entries $Node 'users')) {
-        $role = ''
-        $rb = Get-Node $u 'permissions/role-based'
-        foreach ($k in (Kids $rb)) {
-            $role = $k.LocalName
-            $m = @(Get-Members $k | Where-Object { $_ -ne 'yes' }); if ($m.Count -gt 0) { $role += ' (' + (Join-Or $m) + ')' }
-        }
-        $auth = 'local password'
-        if (Kid $u 'authentication-profile') { $auth = 'auth profile ' + (Get-Text $u 'authentication-profile') }
-        if (Kid $u 'public-key') { $auth += ' + SSH key' }
-        $rows += ,@((EName $u), $role, $auth)
-    }
-    Write-TextTable -Headers @('Admin', 'Role', 'Authentication') -Rows $rows -MaxWidths @(24, 40, 30)
-    W ''
-    W '  Full detail (secrets masked):'
-    Write-Tree -Node $Node -Indent 4
-}
-
-function Sort-ByPriority {
-    param($Nodes, [string[]]$Order)
-    $res = @()
-    foreach ($o in $Order) { $res += @($Nodes | Where-Object { $_.LocalName -eq $o }) }
-    $res += @($Nodes | Where-Object { $Order -notcontains $_.LocalName })
-    return $res
-}
-
-function Write-DeviceEntry {
-    param($Dev, [string]$Source)
-    foreach ($c in (Sort-ByPriority (Kids $Dev) @('deviceconfig', 'network', 'vsys', 'device-group', 'template'))) {
-        switch ($c.LocalName) {
-            'deviceconfig' { Write-DeviceConfig -Node $c -Source $Source }
-            'network' { Write-Network -Node $c -Source $Source }
-            'vsys' { foreach ($v in (Entries $c)) { Write-ObjectScope -Node $v -Source $Source -Scope ("vsys " + (EName $v)) } }
-            'device-group' { foreach ($g in (Entries $c)) { Write-ObjectScope -Node $g -Source $Source -Scope ("device group '" + (EName $g) + "'") } }
-            'template' { foreach ($t in (Entries $c)) { H2 ("[$Source] Panorama template '" + (EName $t) + "'"); $cfg = Kid $t 'config'; if ($cfg) { Write-ConfigRoot -Root $cfg -Source ("$Source / template " + (EName $t)) } else { Write-Tree -Node $t -Indent 2 } } }
-            default { Write-Generic -Node $c -Title ('device > ' + $c.LocalName) -Source $Source }
-        }
-    }
-}
-
-function Write-ConfigRoot {
-    param($Root, [string]$Source)
-    foreach ($c in (Sort-ByPriority (Kids $Root) @('mgt-config', 'devices', 'shared', 'panorama'))) {
-        switch ($c.LocalName) {
-            'mgt-config' { Write-MgtConfig -Node $c -Source $Source }
-            'shared' { $sc = 'shared'; if ($Source -like 'Panorama device group*') { $sc = 'Panorama Shared (pushed)' }; Write-ObjectScope -Node $c -Source $Source -Scope $sc }
-            'panorama' { Write-ObjectScope -Node $c -Source $Source -Scope 'device group (pushed)' }
-            'devices' { foreach ($d in (Entries $c)) { Write-DeviceEntry -Dev $d -Source $Source } }
-            'config' { Write-ConfigRoot -Root $c -Source $Source }
-            default { Write-Generic -Node $c -Title $c.LocalName -Source $Source }
-        }
-    }
-}
-
-# ---------------------------------------------------------------- extraction
-function Expand-TarStream {
-    param([System.IO.Stream]$Stream, [string]$Dest)
-    $buf = New-Object byte[] 512
-    $longName = $null
-    $root = [System.IO.Path]::GetFullPath($Dest)
-    while ($true) {
-        $read = 0
-        while ($read -lt 512) { $n = $Stream.Read($buf, $read, 512 - $read); if ($n -le 0) { break }; $read += $n }
-        if ($read -lt 512) { break }
-        $allZero = $true; foreach ($b in $buf) { if ($b -ne 0) { $allZero = $false; break } }
-        if ($allZero) { break }
-        $name = [System.Text.Encoding]::UTF8.GetString($buf, 0, 100).Split([char]0)[0]
-        $sizeStr = [System.Text.Encoding]::ASCII.GetString($buf, 124, 12).Trim([char]0, ' ')
-        $size = [long]0; if ($sizeStr) { $size = [Convert]::ToInt64($sizeStr, 8) }
-        $type = [char]$buf[156]
-        $mtimeStr = [System.Text.Encoding]::ASCII.GetString($buf, 136, 12).Trim([char]0, ' ')
-        $mtime = $null
-        try { if ($mtimeStr) { $mtime = (New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)).AddSeconds([Convert]::ToInt64($mtimeStr, 8)) } } catch { $mtime = $null }
-        $magic = [System.Text.Encoding]::ASCII.GetString($buf, 257, 5)
-        if ($magic -eq 'ustar') {
-            $prefix = [System.Text.Encoding]::UTF8.GetString($buf, 345, 155).Split([char]0)[0]
-            if ($prefix) { $name = $prefix + '/' + $name }
-        }
-        $data = New-Object byte[] $size
-        $got = 0
-        while ($got -lt $size) { $n = $Stream.Read($data, $got, [int]([Math]::Min(1048576, $size - $got))); if ($n -le 0) { break }; $got += $n }
-        $padding = (512 - ($size % 512)) % 512
-        if ($padding -gt 0) { $skip = New-Object byte[] $padding; $r = 0; while ($r -lt $padding) { $n = $Stream.Read($skip, $r, $padding - $r); if ($n -le 0) { break }; $r += $n } }
-        if ($type -eq 'L') { $longName = [System.Text.Encoding]::UTF8.GetString($data).Split([char]0)[0]; continue }
-        if ($type -eq 'x') {
-            $pax = [System.Text.Encoding]::UTF8.GetString($data)
-            foreach ($line in ($pax -split "`n")) { if ($line -match '^\d+ path=(.*)$') { $longName = $Matches[1] } }
-            continue
-        }
-        if ($type -eq 'g') { continue }
-        if ($longName) { $name = $longName; $longName = $null }
-        $rel = ($name -replace '^\./', '') -replace '/', [System.IO.Path]::DirectorySeparatorChar
-        if ($rel -eq '' -or $rel -eq '.') { continue }
-        $target = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $rel))
-        if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { Write-Warning "Skipping unsafe path in archive: $name"; continue }
-        if ($type -eq '5') { [void][System.IO.Directory]::CreateDirectory($target); continue }
-        if ($type -eq [char]0 -or $type -eq '0' -or $type -eq '7') {
-            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target))
-            [System.IO.File]::WriteAllBytes($target, $data)
-            if ($mtime) { try { [System.IO.File]::SetLastWriteTimeUtc($target, $mtime) } catch { } }
-        }
-    }
-}
-
-function Expand-DeviceState {
-    param([string]$Archive, [string]$Dest)
-    [void][System.IO.Directory]::CreateDirectory($Dest)
-    $isGz = $true
-    $fs = [System.IO.File]::OpenRead($Archive)
-    try { $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte(); $isGz = ($b1 -eq 0x1f -and $b2 -eq 0x8b) } finally { $fs.Dispose() }
-
-    $tar = $null
-    if (-not $NoTar) {
-        # Prefer Windows' built-in bsdtar (System32) over e.g. Git's GNU tar, which reads "C:\..." as host:path.
-        $sysTar = $null
-        if ($env:SystemRoot) { $sysTar = Join-Path $env:SystemRoot 'System32\tar.exe' }
-        if ($sysTar -and (Test-Path -LiteralPath $sysTar)) { $tar = $sysTar }
-        else {
-            $cmd = Get-Command tar -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cmd) { $tar = $cmd.Source; if (-not $tar) { $tar = $cmd.Path } }
-        }
-    }
-
-    if ($tar) {
-        $flags = '-xf'; if ($isGz) { $flags = '-xzf' }
-        $code = 1; $out = @()
-        $oldEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try { $out = & $tar $flags $Archive -C $Dest 2>&1; $code = $LASTEXITCODE }
-        catch { $out = @($_.Exception.Message) }
-        finally { $ErrorActionPreference = $oldEap }
-        if ($code -eq 0) { return 'tar (' + $tar + ')' }
-        Write-Warning ("tar failed (exit $code): " + ($out -join ' ') + ' -- falling back to .NET extraction')
-    }
-    $fs = [System.IO.File]::OpenRead($Archive)
-    try {
-        $stream = $fs
-        if ($isGz) { $stream = New-Object System.IO.Compression.GZipStream($fs, [System.IO.Compression.CompressionMode]::Decompress) }
-        Expand-TarStream -Stream $stream -Dest $Dest
-        if ($isGz) { $stream.Dispose() }
-    } finally { $fs.Dispose() }
-    return '.NET GZipStream + built-in tar reader'
-}
-
-# ---------------------------------------------------------------- classify sources
-function Get-SourceInfo {
-    param([string]$Rel)
-    $r = $Rel -replace '\\', '/'
-    $leaf = [System.IO.Path]::GetFileName($r)
-    $parts = $r.Split('/')
-    if ($parts.Count -gt 1 -and $parts[0] -eq 'template') {
-        return [pscustomobject]@{ Order = 1; Label = 'Panorama template / template stack'; Short = 'template'; Kind = 'config' }
-    }
-    if ($parts.Count -gt 1 -and $parts[0] -eq 'sp') {
-        $vs = ''; if ($parts.Count -gt 2) { $vs = ' ' + $parts[1] }
-        $short = 'device-group'; if ($parts.Count -gt 2) { $short = 'device-group-' + $parts[1] }
-        return [pscustomobject]@{ Order = 2; Label = ('Panorama device group (shared policy)' + $vs); Short = $short; Kind = 'config' }
-    }
-    if ($leaf -eq 'running-config.xml') { return [pscustomobject]@{ Order = 3; Label = 'Local running config'; Short = 'local'; Kind = 'config' } }
-    if ($leaf -like 'merged-running-config*.xml') { return [pscustomobject]@{ Order = 4; Label = 'Merged running config (local + Panorama)'; Short = 'merged'; Kind = 'config' } }
-    if ($leaf -like '*panorama*.xml') { return [pscustomobject]@{ Order = 5; Label = 'Panorama config'; Short = 'panorama'; Kind = 'config' } }
-    return [pscustomobject]@{ Order = 6; Label = 'Supporting file'; Short = ([System.IO.Path]::GetFileNameWithoutExtension($leaf)); Kind = 'other' }
-}
-
-function Save-Text {
-    param([string]$File, [System.Collections.Generic.List[string]]$Lines)
-    $text = ($Lines.ToArray() -join "`r`n") + "`r`n"
-    $enc = New-Object System.Text.UTF8Encoding($true)
-    [System.IO.File]::WriteAllText($File, $text, $enc)
-}
-
 # ---------------------------------------------------------------- main
 $inputItem = Get-Item -LiteralPath $Path
+if ($inputItem.PSIsContainer) { throw "Path must be a single XML file, not a folder: $Path" }
 $inputFull = $inputItem.FullName
-$work = $null
-$extractMethod = 'none (folder input)'
-$baseDir = $null
-$singleXml = $null
 
-if ($inputItem.PSIsContainer) { $baseDir = $inputFull }
-elseif ($inputItem.Extension -eq '.xml') { $singleXml = $inputFull; $baseDir = $inputItem.DirectoryName; $extractMethod = 'none (single XML)' }
-else {
-    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('pan-devstate-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    $extractMethod = Expand-DeviceState -Archive $inputFull -Dest $work
-    $baseDir = $work
+if (-not $OutFile) {
+    $OutFile = Join-Path $inputItem.DirectoryName ([System.IO.Path]::GetFileNameWithoutExtension($inputItem.Name) + '.redacted' + $inputItem.Extension)
 }
+$OutFile = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($OutFile)) { $OutFile } else { Join-Path (Get-Location).ProviderPath $OutFile }))
+$inPlace = [string]::Equals($OutFile, $inputFull, [System.StringComparison]::OrdinalIgnoreCase)
+if ($inPlace -and -not $Force) { throw "OutFile is the input file; use -Force to redact it in place: $OutFile" }
+if (-not $inPlace -and (Test-Path -LiteralPath $OutFile) -and -not $Force) { throw "OutFile already exists; use -Force to overwrite it: $OutFile" }
 
+# Remember whether the input starts with a UTF-8 BOM and whether it uses CRLF, so the output can match it
+# (the XML parser normalises CRLF to LF while reading).
+$hasBom = $false
+$fs = [System.IO.File]::OpenRead($inputFull)
+try { $b = New-Object byte[] 3; $n = $fs.Read($b, 0, 3); $hasBom = ($n -eq 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) } finally { $fs.Dispose() }
+$hasCrlf = ([System.IO.File]::ReadAllText($inputFull)).Contains("`r`n")
+
+$doc = New-Object System.Xml.XmlDocument
+$doc.PreserveWhitespace = $true
+$doc.XmlResolver = $null
+# XmlDocument.Load(path) parses an inline DTD and keeps general entities as EntityReference nodes whose
+# text Protect-Secrets cannot rewrite (e.g. <phash>&x;</phash> leaks). PAN-OS never emits a DOCTYPE, so refuse it.
+$xrs = New-Object System.Xml.XmlReaderSettings
+$xrs.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
 try {
-    $files = @()
-    if ($singleXml) { $files = @(Get-Item -LiteralPath $singleXml) }
-    else { $files = @(Get-ChildItem -LiteralPath $baseDir -Recurse -File | Sort-Object FullName) }
-    $baseFull = [System.IO.Path]::GetFullPath($baseDir).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    $xr = [System.Xml.XmlReader]::Create($inputFull, $xrs)
+    try { $doc.Load($xr) } finally { $xr.Close() }
+} catch { throw ("Cannot parse '" + $inputFull + "' as XML: " + $_.Exception.Message) }
 
-    $sources = @()
-    $others = @()
-    foreach ($f in $files) {
-        $rel = $f.FullName
-        if ($rel.StartsWith($baseFull)) { $rel = $rel.Substring($baseFull.Length) }
-        $rel = $rel -replace '\\', '/'
-        if ($f.Extension -ne '.xml') { $others += [pscustomobject]@{ Rel = $rel; Size = $f.Length; Note = 'not XML - listed only' }; continue }
-        $info = Get-SourceInfo $rel
-        $doc = New-Object System.Xml.XmlDocument
-        $doc.XmlResolver = $null
-        $err = $null
-        # XmlDocument.Load(path) parses an inline DTD and keeps general entities as EntityReference nodes whose
-        # text Protect-Secrets cannot rewrite (e.g. <phash>&x;</phash> leaks). PAN-OS never emits a DOCTYPE, so refuse it.
-        $xrs = New-Object System.Xml.XmlReaderSettings
-        $xrs.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-        try {
-            $xr = [System.Xml.XmlReader]::Create($f.FullName, $xrs)
-            try { $doc.Load($xr) } finally { $xr.Close() }
-        } catch { $err = $_.Exception.Message }
-        if (-not $err -and $info.Kind -eq 'other') {
-            # Name did not identify the file (single saved-config .xml, or bundle re-packed under a top folder): use the root element.
-            $rn = $doc.DocumentElement.LocalName
-            if ($rn -eq 'config') { $info = [pscustomobject]@{ Order = 5; Label = 'PAN-OS config'; Short = $info.Short; Kind = 'config' } }
-            elseif ($rn -eq 'policy') { $info = [pscustomobject]@{ Order = 2; Label = 'Panorama device group (shared policy)'; Short = 'device-group'; Kind = 'config' } }
-        }
-        $masked = 0
-        if (-not $err) { $masked = Protect-Secrets $doc }
-        $sources += [pscustomobject]@{ Rel = $rel; File = $f; Info = $info; Doc = $doc; Error = $err; Masked = $masked }
-    }
-    $dirs = @()
-    if (-not $singleXml) {
-        foreach ($d in @(Get-ChildItem -LiteralPath $baseDir -Recurse -Directory)) {
-            $rel = $d.FullName; if ($rel.StartsWith($baseFull)) { $rel = $rel.Substring($baseFull.Length) }
-            $cnt = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File).Count
-            $dirs += [pscustomobject]@{ Rel = (($rel -replace '\\', '/') + '/'); Files = $cnt }
-        }
-    }
-    $sources = @($sources | Sort-Object @{ Expression = { $_.Info.Order } }, Rel)
+$masked = Protect-Secrets $doc
 
-    foreach ($s in $sources) { if (-not $s.Error -and $s.Info.Kind -eq 'config') { Build-Maps $s.Doc } }
+# Write it back as it was read: the original XML declaration verbatim (or none), same encoding/BOM, original
+# whitespace and newlines. (.NET still normalises empty tags to "<x />" and attribute quotes to double quotes.)
+$decl = $null
+foreach ($c in $doc.ChildNodes) { if ($c.NodeType -eq [System.Xml.XmlNodeType]::XmlDeclaration) { $decl = $c } }
+$enc = New-Object System.Text.UTF8Encoding($false)
+if ($decl -and $decl.Encoding -and $decl.Encoding -notmatch '^utf-?8$') { $enc = [System.Text.Encoding]::GetEncoding($decl.Encoding) }
+$xws = New-Object System.Xml.XmlWriterSettings
+$xws.Encoding = $enc
+$xws.Indent = $false
+$xws.NewLineHandling = [System.Xml.NewLineHandling]::None
+if ($hasCrlf) { $xws.NewLineHandling = [System.Xml.NewLineHandling]::Replace; $xws.NewLineChars = "`r`n" }
+$xws.OmitXmlDeclaration = $true
+$ms = New-Object System.IO.MemoryStream
+$xw = [System.Xml.XmlWriter]::Create($ms, $xws)
+try { $doc.Save($xw) } finally { $xw.Close() }
+$outDir = [System.IO.Path]::GetDirectoryName($OutFile)
+if (-not (Test-Path -LiteralPath $outDir)) { [void][System.IO.Directory]::CreateDirectory($outDir) }
+$out = [System.IO.File]::Create($OutFile)
+try {
+    if ($hasBom) { $pre = $enc.GetPreamble(); if ($pre.Length -eq 0) { $pre = [byte[]](0xEF, 0xBB, 0xBF) }; $out.Write($pre, 0, $pre.Length) }
+    if ($decl) { $d = $enc.GetBytes('<?xml ' + $decl.InnerText + '?>'); $out.Write($d, 0, $d.Length) }
+    $body = $ms.ToArray(); $out.Write($body, 0, $body.Length)
+} finally { $out.Dispose(); $ms.Dispose() }
 
-    # header facts
-    $hostname = ''; $version = ''; $panServers = @(); $hostSrc = ''
-    foreach ($s in $sources) {
-        if ($s.Error -or $s.Info.Kind -ne 'config') { continue }
-        $root = $s.Doc.DocumentElement
-        $v = $root.GetAttribute('detail-version'); if (-not $v) { $v = $root.GetAttribute('version') }
-        if ($v -and (-not $version -or $s.Info.Short -eq 'local')) { $version = $v + '  (from ' + $s.Rel + ')' }
-        $hn = $s.Doc.SelectSingleNode('//deviceconfig/system/hostname')
-        if ($hn -and (-not $hostname -or $s.Info.Short -eq 'local')) { if (-not ($hostname -and $hostSrc -eq 'local')) { $hostname = $hn.InnerText.Trim(); $hostSrc = $s.Info.Short } }
-        foreach ($p in @($s.Doc.SelectNodes('//deviceconfig/system/panorama/local-panorama/*[starts-with(local-name(),"panorama-server")] | //deviceconfig/system/*[starts-with(local-name(),"panorama-server")]'))) { $panServers += $p.InnerText.Trim() }
-    }
-    if (-not $hostname) { $hostname = 'unknown-host' }
-    $panServers = @($panServers | Select-Object -Unique)
-    $hasTemplate = @($sources | Where-Object { $_.Info.Short -eq 'template' }).Count -gt 0
-    $hasSp = @($sources | Where-Object { $_.Info.Short -like 'device-group*' }).Count -gt 0
-    $managed = 'No (no Panorama server configured, sp/ and template/ empty)'
-    if ($hasTemplate -or $hasSp) { $managed = 'Yes (Panorama-pushed files present)' }
-    elseif ($panServers.Count -gt 0) { $managed = 'Panorama server configured, but no pushed template/device-group files in this export' }
-
-    $exportName = $inputItem.Name
-    $exportDate = ''
-    if ($exportName -match '(20\d{2})(\d{2})(\d{2})[-_]?(\d{2})(\d{2})') { $exportDate = "$($Matches[1])-$($Matches[2])-$($Matches[3]) $($Matches[4]):$($Matches[5]) (from file name)" }
-    $rc = $sources | Where-Object { $_.Info.Short -eq 'local' } | Select-Object -First 1
-    $rcTime = ''; if ($rc) { $rcTime = $rc.File.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + ' (running-config.xml timestamp, local time)' }
-
-    if (-not $OutFile) {
-        $dir = $inputItem.DirectoryName; if ($inputItem.PSIsContainer) { $dir = $inputItem.Parent.FullName }
-        $OutFile = Join-Path $dir ($hostname + '-device-state.txt')
-    }
-    $OutFile = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($OutFile)) { $OutFile } else { Join-Path (Get-Location).ProviderPath $OutFile }))
-
-    # ---- build per-source bodies
-    $bodies = @{}
-    foreach ($s in $sources) {
-        $script:Out = New-Object System.Collections.Generic.List[string]
-        H1 ("SOURCE: " + $s.Info.Label + "  --  " + $s.Rel)
-        W ('  File: ' + $s.Rel + '   Size: ' + $s.File.Length + ' bytes   Modified: ' + $s.File.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
-        if ($s.Error) { W ('  ERROR: could not parse XML: ' + $s.Error) }
-        else {
-            $root = $s.Doc.DocumentElement
-            $attrs = @(); foreach ($a in @($root.Attributes)) { $attrs += ($a.Name + '=' + $a.Value) }
-            W ('  Root element: <' + $root.LocalName + '> ' + ($attrs -join ' '))
-            W ('  Secret values masked in this file: ' + $s.Masked)
-            $label = $s.Info.Label
-            if ($s.Info.Kind -eq 'config') { Write-ConfigRoot -Root $root -Source $label }
-            else { Write-Generic -Node $root -Title ('<' + $root.LocalName + '>') -Source $label }
-        }
-        $bodies[$s.Rel] = $script:Out
-    }
-
-    # ---- effective policy order
-    $script:Out = New-Object System.Collections.Generic.List[string]
-    H1 'EFFECTIVE RULE ORDER (all sources combined)'
-    W '  Evaluation order on the firewall: Panorama PRE rules -> local rules -> Panorama POST rules -> default intrazone/interzone rules.'
-    W '  Merged (merged-running-config) and Panorama-config files are excluded here to avoid double counting if the device state files are present.'
-    $useRules = @($script:Rules | Where-Object { $_.Source -notlike 'Merged*' })
-    if ($useRules.Count -eq 0) { $useRules = @($script:Rules) }
-    foreach ($kind in @('security', 'nat')) {
-        $list = @($useRules | Where-Object { $_.Kind -eq $kind })
-        $i = 0
-        $sorted = @()
-        foreach ($st in @('pre', 'local', 'post')) { $sorted += @($list | Where-Object { $_.Stage -eq $st }) }
-        $rows = @()
-        foreach ($r in $sorted) {
-            $i++
-            $stage = switch ($r.Stage) { 'pre' { 'PRE (Panorama)' } 'post' { 'POST (Panorama)' } default { 'local' } }
-            $rows += ,(@([string]$i, $stage, ($r.Scope)) + $r.Row)
-        }
-        H3 ("Effective " + $kind.ToUpper() + " policy order")
-        if ($kind -eq 'security') {
-            Write-TextTable -Headers @('#', 'Stage', 'Scope', 'Name', 'From', 'To', 'Source', 'Destination', 'Application', 'Service', 'Action', 'Disabled', 'Description') -Rows $rows -MaxWidths @(4, 15, 18, 28, 16, 16, 22, 22, 20, 20, 18, 8, 40)
-        } else {
-            Write-TextTable -Headers @('#', 'Stage', 'Scope', 'Name', 'From', 'To', 'To intf', 'Source', 'Destination', 'Service', 'Source translation', 'Dest translation', 'Disabled', 'Description') -Rows $rows -MaxWidths @(4, 15, 18, 26, 14, 14, 12, 20, 20, 16, 30, 24, 8, 36)
-        }
-    }
-    $effective = $script:Out
-
-    # ---- header
-    $script:Out = New-Object System.Collections.Generic.List[string]
-    W ('PAN-OS DEVICE STATE REPORT')
-    W ('=' * 100)
-    W ('Hostname           : ' + $hostname)
-    W ('PAN-OS version     : ' + $version)
-    W ('Export file        : ' + $exportName)
-    W ('Export path        : ' + $inputFull)
-    if ($exportDate) { W ('Export date        : ' + $exportDate) }
-    if ($rcTime) { W ('Config timestamp   : ' + $rcTime) }
-    W ('Panorama managed   : ' + $managed)
-    if ($panServers.Count -gt 0) { W ('Panorama server(s) : ' + ($panServers -join ', ')) }
-    W ('Extraction         : ' + $extractMethod)
-    W ('Report generated   : ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz') + ' by Convert-PanDeviceState.ps1 v' + $script:ScriptVersion + ' (PowerShell ' + $PSVersionTable.PSVersion.ToString() + ')')
-    W ('Secrets            : phash/key/password/secret/private-key style values are masked as ' + $script:Mask)
-    W ''
-    W 'SOURCE FILES FOUND'
-    $rows = @()
-    foreach ($s in $sources) {
-        $st = 'parsed'; if ($s.Error) { $st = 'XML ERROR' }
-        $rows += ,@($s.Rel, $s.Info.Label, [string]$s.File.Length, $st)
-    }
-    foreach ($o in $others) { $rows += ,@($o.Rel, $o.Note, [string]$o.Size, 'listed') }
-    foreach ($d in $dirs) { $state = 'folder, ' + $d.Files + ' file(s)'; if ($d.Files -eq 0) { $state = 'folder, EMPTY' }; $rows += ,@($d.Rel, 'directory', '', $state) }
-    Write-TextTable -Headers @('File', 'Applies as', 'Bytes', 'Status') -Rows $rows -MaxWidths @(50, 45, 10, 20)
-    W ''
-    W 'HOW TO READ THIS REPORT'
-    W '  Every heading starts with [source] so you can see where a setting came from:'
-    W '    [Local running config]                        configured on the firewall itself (incl. local overrides of template values)'
-    W '    [Panorama template / template stack]          network/device settings pushed from Panorama templates (template/)'
-    W '    [Panorama device group (shared policy) vsysN] objects + PRE/POST rules pushed from Panorama device groups (sp/)'
-    W '    scope "Panorama Shared (pushed)"              objects pushed from the Panorama Shared location (sp/ file, <shared>)'
-    W '    scope "device group (pushed)"                 objects/rules from the firewall''s device group and its parent groups (sp/ file, <panorama>)'
-    W '  A local value overrides the same template value. Sections not specifically formatted are printed as an indented tree.'
-    W ''
-    W 'CONTENTS'
-    $n = 1
-    foreach ($s in $sources) { W ('  ' + $n + '. ' + $s.Info.Label + ' - ' + $s.Rel); $n++ }
-    W ('  ' + $n + '. Effective rule order (all sources combined)')
-    $header = $script:Out
-
-    # ---- combined file
-    $all = New-Object System.Collections.Generic.List[string]
-    $all.AddRange($header)
-    foreach ($s in $sources) { $all.AddRange($bodies[$s.Rel]) }
-    $all.AddRange($effective)
-    $all.Add(''); $all.Add('END OF REPORT')
-    $outDir = [System.IO.Path]::GetDirectoryName($OutFile)
-    if (-not (Test-Path -LiteralPath $outDir)) { [void][System.IO.Directory]::CreateDirectory($outDir) }
-    Save-Text -File $OutFile -Lines $all
-    Write-Host ('Wrote ' + $OutFile)
-
-    if ($PerSourceFiles) {
-        $base = [System.IO.Path]::Combine($outDir, [System.IO.Path]::GetFileNameWithoutExtension($OutFile))
-        $used = @{}
-        foreach ($s in $sources) {
-            $short = $s.Info.Short -replace '[^A-Za-z0-9_.-]', '_'
-            if ($used.ContainsKey($short)) { $used[$short]++; $short = $short + '-' + $used[$short] } else { $used[$short] = 1 }
-            $f = $base + '.' + $short + '.txt'
-            $l = New-Object System.Collections.Generic.List[string]
-            $l.AddRange($header); $l.AddRange($bodies[$s.Rel])
-            Save-Text -File $f -Lines $l
-            Write-Host ('Wrote ' + $f)
-        }
-    }
-}
-finally {
-    if ($work -and (Test-Path -LiteralPath $work)) {
-        if ($KeepExtracted) { Write-Host ('Extracted files kept in ' + $work) }
-        else { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
+Write-Host ('Masked ' + $masked + ' value(s); wrote ' + $OutFile)
